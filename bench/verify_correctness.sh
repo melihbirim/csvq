@@ -1076,13 +1076,23 @@ check_self \
   "SUM(amount) WHERE amount > 50 (quote-heavy, crosses many 2MB boundaries)" \
   "SELECT SUM(amount) FROM '$BOUNDARY_CSV' WHERE amount > 50"
 
-# Opportunistic real-world check: gated on the gitignored taxi fixture
-# (bench/bench_taxi.sh downloads it), so CI stays green without a multi-GB
-# download but still gets this if the fixture happens to be present locally.
-TAXI_CSV="${SCRIPT_DIR}/bench/.taxi-data/trips.csv"
+# Real-world-shaped check against the taxi schema: quoted fields, a genuinely
+# malformed row, real value distributions.
+#
+# bench/taxi_sample.csv is a ~1MB committed slice of the taxi dataset, so this
+# always runs on a fresh clone. It is deliberately NOT one of the files in
+# bench/.taxi-data/, which bench_taxi.sh downloads and caches by existence —
+# a committed stub in there would make --sample skip its download forever and
+# silently benchmark 1MB while reporting a 417MB run.
+#
+# Note what the small size costs: the parallel scan path only engages above
+# 10MB, so this runs sequentially. It checks csvql agrees with DuckDB on messy
+# real data (quoted fields, a genuinely malformed row), NOT that parallel
+# scanning is correct — run bench/bench_taxi.sh for that.
+TAXI_CSV="${SCRIPT_DIR}/bench/taxi_sample.csv"
 if [[ -f "$TAXI_CSV" ]]; then
   echo ""
-  echo "── Large quoted-field file, parallel WHERE (#139, real dataset) ─"
+  echo "── Quoted-field real dataset, taxi sample (#139) ─"
   # null_padding=true: the raw dataset has at least one genuinely malformed
   # row (fewer fields than the header) that DuckDB's strict-mode reader
   # refuses outright by default (CSV Error, wrong column count). csvql pads
@@ -1091,7 +1101,7 @@ if [[ -f "$TAXI_CSV" ]]; then
   # semantic on DuckDB's side instead of asserting DuckDB's strict-mode
   # rejection is the correct behavior to diff against.
   check \
-    "COUNT(*) WHERE trip_distance > 5 (taxi dataset, parallel scan)" \
+    "COUNT(*) WHERE trip_distance > 5 (taxi sample, sequential at this size)" \
     "SELECT COUNT(*) FROM '$TAXI_CSV' WHERE trip_distance > 5" \
     "SELECT COUNT(*) FROM read_csv_auto('$TAXI_CSV', null_padding=true) WHERE trip_distance > 5"
 fi
