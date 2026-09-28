@@ -1,0 +1,8 @@
+# Reproduce: ./bench/query_fuzz.sh --seed 4242 --count 1500 --stop-on-fail
+kind: scalar_agg
+csvql_sql: SELECT VARIANCE(id) FROM '/Users/melihbirim/code/birim.one.dev/csvql/large_test.csv' WHERE id > 6050
+duck_sql: SELECT VARIANCE(id) FROM __fuzz_csv WHERE id > 6050
+--- csvql output (normalized) ---
+16218037
+--- duckdb output (normalized) ---
+16218038

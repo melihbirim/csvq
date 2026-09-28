@@ -2735,16 +2735,19 @@ const OptionalSlots = struct {
     distinct: ?[]?std.StringHashMap(void) = null,
     values: ?[]?std.ArrayList(f64) = null,
     concat: ?[]?std.ArrayList([]const u8) = null,
+    means: ?[]f64 = null,
 
     /// Build the shared all-null arrays for whichever kinds `specs` never uses.
     fn forSpecs(ka: Allocator, specs: []const AggSpec, n_aggs: usize) !OptionalSlots {
         var needs_distinct = false;
         var needs_values = false;
         var needs_concat = false;
+        var needs_means = false;
         for (specs) |spec| switch (spec.func_type) {
             .count_distinct => needs_distinct = true,
             .median => needs_values = true,
             .group_concat => needs_concat = true,
+            .variance, .stddev, .variance_samp, .stddev_samp => needs_means = true,
             else => {},
         };
         var opt = OptionalSlots{};
@@ -2763,6 +2766,11 @@ const OptionalSlots = struct {
             for (c) |*x| x.* = null;
             opt.concat = c;
         }
+        if (!needs_means) {
+            const m = try ka.alloc(f64, n_aggs);
+            @memset(m, 0.0);
+            opt.means = m;
+        }
         return opt;
     }
 };
@@ -2771,7 +2779,8 @@ const CompactAccum = struct {
     key_values: [][]const u8, // GROUP BY column values, arena-owned
     count: i64, // row count for COUNT(*)
     sums: []f64, // sum[i] for agg_spec i, arena-alloc, zero-init
-    sum_sqs: []f64, // sum of squares[i] for VARIANCE/STDDEV, arena-alloc, zero-init
+    sum_sqs: []f64, // Welford M2[i] for VARIANCE/STDDEV, arena-alloc, zero-init
+    means: []f64, // Welford running mean[i], only written when a variance/stddev agg exists
     sum_counts: []i64, // non-null input count per agg (for AVG), arena-alloc
     mins: []f64, // min[i], arena-alloc, init to +inf
     maxs: []f64, // max[i], arena-alloc, init to -inf
@@ -2798,6 +2807,11 @@ const CompactAccum = struct {
             for (v) |*vl| vl.* = null;
             break :blk v;
         };
+        const means = opt.means orelse blk: {
+            const m = try ka.alloc(f64, n_aggs);
+            @memset(m, 0.0);
+            break :blk m;
+        };
         const concat_lists = opt.concat orelse blk: {
             const c = try ka.alloc(?std.ArrayList([]const u8), n_aggs);
             for (c) |*cl| cl.* = null;
@@ -2815,6 +2829,7 @@ const CompactAccum = struct {
             .count = 0,
             .sums = sums,
             .sum_sqs = sum_sqs,
+            .means = means,
             .sum_counts = sum_counts,
             .mins = mins,
             .maxs = maxs,
@@ -3357,23 +3372,67 @@ fn fmtGroupConcat(allocator: Allocator, cl: ?std.ArrayList([]const u8), sep: []c
     return std.mem.join(allocator, sep, list.items);
 }
 
+/// True for the aggregates that need Welford state rather than a plain sum.
+inline fn needsVariance(t: aggregation.AggregateType) bool {
+    return t == .variance or t == .stddev or t == .variance_samp or t == .stddev_samp;
+}
+
+/// One Welford step for slot `i`. Call AFTER sum_counts[i] has been incremented
+/// for this value, since the running count is the divisor.
+///
+/// The old code accumulated a plain sum of squares and finished with
+/// sum_sq/n - mean*mean. Both terms are large and nearly equal once the values
+/// are large relative to their spread, so the subtraction cancels the answer
+/// away: on a column of unix timestamps it was 84% low, and at 1e9 it returned
+/// exactly 0 (#190). Welford never forms those two large terms at all.
+inline fn welfordAdd(means: []f64, m2: []f64, n_after: i64, i: usize, val: f64) void {
+    const n: f64 = @floatFromInt(n_after);
+    const delta = val - means[i];
+    means[i] += delta / n;
+    m2[i] += delta * (val - means[i]);
+}
+
+/// Chan's parallel merge: combine two Welford accumulators. `n_a`/`n_b` are the
+/// counts BEFORE the caller folds them together.
+inline fn welfordMerge(
+    mean_a: *f64,
+    m2_a: *f64,
+    n_a: i64,
+    mean_b: f64,
+    m2_b: f64,
+    n_b: i64,
+) void {
+    if (n_b == 0) return;
+    if (n_a == 0) {
+        mean_a.* = mean_b;
+        m2_a.* = m2_b;
+        return;
+    }
+    const na: f64 = @floatFromInt(n_a);
+    const nb: f64 = @floatFromInt(n_b);
+    const n: f64 = na + nb;
+    const delta = mean_b - mean_a.*;
+    mean_a.* += delta * nb / n;
+    m2_a.* += m2_b + delta * delta * na * nb / n;
+}
+
 /// Format population VARIANCE (sum_sq/n - mean^2) or STDDEV (its sqrt) from the
 /// running sum, sum-of-squares, and count. Empty group → "0".
 /// is_sample selects the N-1 (sample) denominator instead of N (population) —
 /// #110: bare VARIANCE/STDDEV default to sample, matching DuckDB/SQL-standard
 /// convention. Sample variance/stddev is undefined below 2 data points,
 /// matching DuckDB's NULL there (csvql's empty-string NULL-equivalent).
-fn fmtVarStd(allocator: Allocator, sum_sq: f64, sum: f64, n: i64, is_stddev: bool, is_sample: bool, round_digits: ?u8) ![]u8 {
+fn fmtVarStd(allocator: Allocator, m2: f64, n: i64, is_stddev: bool, is_sample: bool, round_digits: ?u8) ![]u8 {
     if (is_sample) {
         if (n < 2) return allocator.dupe(u8, "");
     } else if (n < 1) {
         return allocator.dupe(u8, "0");
     }
     const nf: f64 = @floatFromInt(n);
-    const mean = sum / nf;
-    var v = sum_sq / nf - mean * mean; // population variance
+    // m2 is Welford's sum of squared deviations, so the variance is a division,
+    // not a difference of two large numbers (#190).
+    var v = m2 / (if (is_sample) nf - 1.0 else nf);
     if (v < 0) v = 0; // guard tiny negative from float rounding
-    if (is_sample and n > 1) v = v * nf / (nf - 1.0); // population -> sample
     if (is_stddev) v = @sqrt(v);
     return fmtAggrF64(allocator, v, round_digits);
 }
@@ -4026,7 +4085,7 @@ fn executeScalarAgg(
             accum.count += partial.count;
             for (0..n_aggs) |i| {
                 accum.sums[i] += partial.sums[i];
-                accum.sum_sqs[i] += partial.sum_sqs[i];
+                welfordMerge(&accum.means[i], &accum.sum_sqs[i], accum.sum_counts[i], partial.means[i], partial.sum_sqs[i], partial.sum_counts[i]);
                 accum.sum_counts[i] += partial.sum_counts[i];
                 if (partial.mins[i] < accum.mins[i]) accum.mins[i] = partial.mins[i];
                 if (partial.maxs[i] > accum.maxs[i]) accum.maxs[i] = partial.maxs[i];
@@ -4148,14 +4207,14 @@ fn executeScalarAgg(
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                             const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                             accum.sums[i] += val;
-                            if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) accum.sum_sqs[i] += val * val;
                             accum.sum_counts[i] += 1;
+                            if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
                         } else if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
                                     accum.sums[i] += val;
-                                    if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) accum.sum_sqs[i] += val * val;
                                     accum.sum_counts[i] += 1;
+                                    if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
                                 } else |_| {}
                             }
                         }
@@ -4234,10 +4293,10 @@ fn executeScalarAgg(
                 else
                     try allocator.dupe(u8, "");
             },
-            .variance => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, false, spec.round_digits),
-            .stddev => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, false, spec.round_digits),
-            .variance_samp => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, true, spec.round_digits),
-            .stddev_samp => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, true, spec.round_digits),
+            .variance => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sum_counts[i], false, false, spec.round_digits),
+            .stddev => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sum_counts[i], true, false, spec.round_digits),
+            .variance_samp => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sum_counts[i], false, true, spec.round_digits),
+            .stddev_samp => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sum_counts[i], true, true, spec.round_digits),
             .median => try fmtMedian(allocator, accum.value_lists[i], spec.round_digits),
 
             .group_concat => try fmtGroupConcat(allocator, accum.concat_lists[i], spec.sep),
@@ -4466,6 +4525,7 @@ fn foldPartialGroup(
             .count = partial.count,
             .sums = try ka.dupe(f64, partial.sums),
             .sum_sqs = try ka.dupe(f64, partial.sum_sqs),
+            .means = try ka.dupe(f64, partial.means),
             .sum_counts = try ka.dupe(i64, partial.sum_counts),
             .mins = try ka.dupe(f64, partial.mins),
             .maxs = try ka.dupe(f64, partial.maxs),
@@ -4479,7 +4539,7 @@ fn foldPartialGroup(
         accum.count += partial.count;
         for (0..n_aggs) |i| {
             accum.sums[i] += partial.sums[i];
-            accum.sum_sqs[i] += partial.sum_sqs[i];
+            welfordMerge(&accum.means[i], &accum.sum_sqs[i], accum.sum_counts[i], partial.means[i], partial.sum_sqs[i], partial.sum_counts[i]);
             accum.sum_counts[i] += partial.sum_counts[i];
             if (partial.mins[i] < accum.mins[i]) accum.mins[i] = partial.mins[i];
             if (partial.maxs[i] > accum.maxs[i]) accum.maxs[i] = partial.maxs[i];
@@ -4647,14 +4707,14 @@ fn gbApplyAggs(ctx: *GbWorkerCtx, aa: Allocator, accum: *CompactAccum, record: [
                     const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                     const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                     accum.sums[i] += val;
-                    if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) accum.sum_sqs[i] += val * val;
                     accum.sum_counts[i] += 1;
+                    if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
                 } else if (spec.col_idx) |cidx| {
                     if (cidx < record.len) {
                         if (parseNumericFast(record[cidx])) |val| {
                             accum.sums[i] += val;
-                            if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) accum.sum_sqs[i] += val * val;
                             accum.sum_counts[i] += 1;
+                            if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
                         } else |_| {}
                     }
                 }
@@ -5252,14 +5312,14 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                             const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                             ctx.partial_accum.sums[i] += val;
-                            if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) ctx.partial_accum.sum_sqs[i] += val * val;
                             ctx.partial_accum.sum_counts[i] += 1;
+                            if (needsVariance(spec.func_type)) welfordAdd(ctx.partial_accum.means, ctx.partial_accum.sum_sqs, ctx.partial_accum.sum_counts[i], i, val);
                         } else if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
                                     ctx.partial_accum.sums[i] += val;
-                                    if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) ctx.partial_accum.sum_sqs[i] += val * val;
                                     ctx.partial_accum.sum_counts[i] += 1;
+                                    if (needsVariance(spec.func_type)) welfordAdd(ctx.partial_accum.means, ctx.partial_accum.sum_sqs, ctx.partial_accum.sum_counts[i], i, val);
                                 } else |_| {}
                             }
                         }
@@ -5370,14 +5430,14 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                             const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                             ctx.partial_accum.sums[i] += val;
-                            if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) ctx.partial_accum.sum_sqs[i] += val * val;
                             ctx.partial_accum.sum_counts[i] += 1;
+                            if (needsVariance(spec.func_type)) welfordAdd(ctx.partial_accum.means, ctx.partial_accum.sum_sqs, ctx.partial_accum.sum_counts[i], i, val);
                         } else if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
                                     ctx.partial_accum.sums[i] += val;
-                                    if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) ctx.partial_accum.sum_sqs[i] += val * val;
                                     ctx.partial_accum.sum_counts[i] += 1;
+                                    if (needsVariance(spec.func_type)) welfordAdd(ctx.partial_accum.means, ctx.partial_accum.sum_sqs, ctx.partial_accum.sum_counts[i], i, val);
                                 } else |_| {}
                             }
                         }
@@ -6109,14 +6169,14 @@ fn executeGroupBy(
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                             const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                             accum.sums[i] += val;
-                            if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) accum.sum_sqs[i] += val * val;
                             accum.sum_counts[i] += 1;
+                            if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
                         } else if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
                                     accum.sums[i] += val;
-                                    if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) accum.sum_sqs[i] += val * val;
                                     accum.sum_counts[i] += 1;
+                                    if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
                                 } else |_| {}
                             }
                         }
@@ -6280,10 +6340,10 @@ fn executeGroupBy(
                     else
                         try sra.dupe(u8, "");
                 },
-                .variance => try fmtVarStd(sra, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, false, spec.round_digits),
-                .stddev => try fmtVarStd(sra, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, false, spec.round_digits),
-                .variance_samp => try fmtVarStd(sra, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, true, spec.round_digits),
-                .stddev_samp => try fmtVarStd(sra, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, true, spec.round_digits),
+                .variance => try fmtVarStd(sra, accum.sum_sqs[i], accum.sum_counts[i], false, false, spec.round_digits),
+                .stddev => try fmtVarStd(sra, accum.sum_sqs[i], accum.sum_counts[i], true, false, spec.round_digits),
+                .variance_samp => try fmtVarStd(sra, accum.sum_sqs[i], accum.sum_counts[i], false, true, spec.round_digits),
+                .stddev_samp => try fmtVarStd(sra, accum.sum_sqs[i], accum.sum_counts[i], true, true, spec.round_digits),
                 .median => try fmtMedian(sra, accum.value_lists[i], spec.round_digits),
 
                 .group_concat => try fmtGroupConcat(sra, accum.concat_lists[i], spec.sep),
@@ -6516,6 +6576,28 @@ test "VARIANCE / STDDEV: bare defaults to sample, _POP stays population (#110)" 
     defer allocator.free(out_samp);
     try std.testing.expect(std.mem.indexOf(u8, out_samp, "4.571428") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_samp, "2.1380") != null);
+}
+
+test "VARIANCE / STDDEV: large-magnitude values keep their precision (#190)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Three consecutive integers have a sample variance of exactly 1 at any
+    // magnitude. The old sum-of-squares formula computed sum_sq/n - mean*mean,
+    // two large and nearly equal terms, and at 1e9 the subtraction cancelled
+    // the whole answer away and returned 0.
+    const big = "x\n1000000000\n1000000001\n1000000002\n";
+    const out_big = try runQueryForTest(allocator, &tmp, big, "SELECT VARIANCE(x) AS v, STDDEV(x) AS s FROM '{s}'");
+    defer allocator.free(out_big);
+    try std.testing.expect(std.mem.indexOf(u8, out_big, "1,1") != null);
+
+    // Unix timestamps one second apart: 10 rows, sample variance 9.1666...
+    const ts = "t\n1727000000\n1727000001\n1727000002\n1727000003\n1727000004\n" ++
+        "1727000005\n1727000006\n1727000007\n1727000008\n1727000009\n";
+    const out_ts = try runQueryForTest(allocator, &tmp, ts, "SELECT VARIANCE(t) AS v FROM '{s}'");
+    defer allocator.free(out_ts);
+    try std.testing.expect(std.mem.indexOf(u8, out_ts, "9.16666") != null);
 }
 
 test "VARIANCE / STDDEV: sample is undefined (empty) for a single-row group" {
