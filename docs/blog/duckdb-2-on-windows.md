@@ -113,7 +113,9 @@ The spread between VMs was 0–1%: the Linux runners are much steadier than the 
 
 Spread across VMs was 4–8%. On one VM, csvql took 2.5–5.2 s per query, DuckDB 1.5.5 took 12.4–13.4 s and the alpha 9.7–10.6 s. By the time this run happened, the rolling alpha link was serving `v2.0.0-alpha43678`.
 
-Getting this table took two tries. The first Windows 8 GB run needed 34 minutes for a single round and then crashed. Logging every run showed why: the harness sent each engine's output to Windows' `NUL` device, and in that setup the DuckDB 2.0 alpha took 110–130 s per query instead of about 10 s. Whichever engine ran next was slowed too, most likely because the cached file had been dropped: csvql went from 2.5 s to about 21 s. Reading the output through a pipe instead made all three engines stable. That looks like a bug in the alpha, not something to benchmark, so the harness now always uses a pipe.
+Getting this table took two tries. The first Windows 8 GB run needed 34 minutes for a single round and then crashed. Logging every run showed why: the harness sent each engine's output to Windows' `NUL` device, and in that setup the DuckDB 2.0 alpha took 110–130 s per query instead of about 10 s. Whichever engine ran next was slowed too, most likely because the cached file had been dropped: csvql went from 2.5 s to about 21 s. Reading the output through a pipe instead made all three engines stable, so the harness now always uses a pipe.
+
+To make sure this wasn't our harness, I reproduced it with plain `cmd.exe` and no Python ([`bench/duckdb_nul_repro.ps1`](https://github.com/melihbirim/csvql/blob/main/bench/duckdb_nul_repro.ps1)). The same query with output to `> NUL` took 128.6 s on the v2.0 alpha, against 10.1 s piped. Adding `SET enable_progress_bar=false` brought it back to 10.3 s, and DuckDB 1.5.5 took about 12.7–13.0 s in every case. So it's the alpha's progress bar when output goes to `NUL`. It's reported as [duckdb/duckdb#26261](https://github.com/duckdb/duckdb/issues/26261).
 
 ---
 
