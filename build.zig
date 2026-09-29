@@ -440,4 +440,16 @@ pub fn build(b: *std.Build) void {
     arena_buffer_tests.linkLibC();
     const run_arena_buffer_tests = b.addRunArtifact(arena_buffer_tests);
     test_step.dependOn(&run_arena_buffer_tests.step);
+
+    // file_map tests (mmap on POSIX, MapViewOfFile on Windows)
+    const file_map_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/file_map.zig"),
+        }),
+    });
+    file_map_tests.linkLibC();
+    const run_file_map_tests = b.addRunArtifact(file_map_tests);
+    test_step.dependOn(&run_file_map_tests.step);
 }

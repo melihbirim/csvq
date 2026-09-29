@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const file_map = @import("file_map.zig");
 const parser = @import("parser.zig");
 const csv = @import("csv.zig");
 const fast_sort = @import("fast_sort.zig");
@@ -8,22 +9,6 @@ const arena_buffer = @import("arena_buffer.zig");
 const simd = @import("simd.zig");
 const Allocator = std.mem.Allocator;
 
-fn mapFile(allocator: Allocator, file: std.fs.File, size: u64) ![]const u8 {
-    if (builtin.os.tag == .windows) {
-        return file.readToEndAlloc(allocator, @intCast(size));
-    }
-    const mapped = try std.posix.mmap(null, @intCast(size), std.posix.PROT.READ, .{ .TYPE = .SHARED }, file.handle, 0);
-    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
-    return mapped;
-}
-
-fn unmapFile(allocator: Allocator, data: []const u8) void {
-    if (builtin.os.tag == .windows) {
-        allocator.free(data);
-    } else {
-        std.posix.munmap(@alignCast(data));
-    }
-}
 /// Collapse `""` escape pairs to `"` within an already quote-stripped field.
 /// Only called when the field is known to contain `""` — see issue #89.
 fn unescapeQuotesArena(arena: *std.heap.ArenaAllocator, field: []const u8) ![]const u8 {
@@ -120,8 +105,8 @@ pub fn executeMapped(
 ) !void {
     const file_size = (try input_file.stat()).size;
 
-    const data = try mapFile(allocator, input_file, file_size);
-    defer unmapFile(allocator, data);
+    const data = try file_map.map(input_file, file_size);
+    defer file_map.unmap(data);
 
     // Scratch arena for the rare field containing an escaped "" quote pair,
     // which simd.parseCSVFieldsStatic returns unescaped (issue #89). Reset
