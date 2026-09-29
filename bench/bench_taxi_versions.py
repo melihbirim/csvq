@@ -135,12 +135,44 @@ def norm_rows(text):
     return sorted(",".join(norm_cell(c) for c in ln.split(",")) for ln in lines[1:])
 
 
+def free_mb():
+    """Available physical memory in MB, or None where we can't tell cheaply."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            m = MEMORYSTATUSEX()
+            m.dwLength = ctypes.sizeof(m)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+            return m.ullAvailPhys // (1 << 20)
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:  # noqa: BLE001 — diagnostics only
+        pass
+    return None
+
+
 def timed(argv):
+    """Wall time of one run, or None if it failed (stderr tail is printed).
+    Output is read through a pipe and discarded, never sent to the null
+    device: on Windows, DuckDB v2.0.0-alpha ran ~12x slower with stdout on
+    NUL (110-130 s vs ~10 s per 8 GB query) and evicted the page cache for
+    whichever engine ran next."""
     t = time.perf_counter()
-    p = subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     dt = time.perf_counter() - t
     if p.returncode != 0:
-        raise RuntimeError(f"exit {p.returncode}: {argv[0]}")
+        tail = p.stderr.decode(errors="replace").strip()[-500:]
+        print(f"    FAILED exit {p.returncode} after {dt:.1f}s: {argv[0]}\n    stderr: {tail!r}", flush=True)
+        return None
     return dt
 
 
@@ -157,14 +189,17 @@ def md_table(res):
         "|---|---:|" + "---:|---:|" * len(engines),
     ]
     for q, r in res["queries"].items():
-        row = [q, f"{r['median']['csvql']:.3f}s"]
+        c = r["median"]["csvql"]
+        row = [q, "FAILED" if c is None else f"{c:.3f}s"]
         for e in engines:
             if not r["match"].get(e, False):
                 row += ["MISMATCH", "—"]
+            elif e not in r["ratio"]:
+                row += ["FAILED", "—"]
             else:
                 row += [f"{r['median'][e]:.3f}s", f"**{r['ratio'][e]:.2f}x**"]
         lines.append("| " + " | ".join(row) + " |")
-    lines += ["", "Ratio > 1 means csvql is faster. A MISMATCH row reports no speed."]
+    lines += ["", "Ratio > 1 means csvql is faster. A MISMATCH or FAILED cell reports no speed."]
     return "\n".join(lines)
 
 
@@ -206,21 +241,33 @@ def cmd_run(a):
         print(f"{q} correctness: {match}", flush=True)
 
     # 2) Timing — one warm-up pass (page cache equal for everyone), then
-    #    interleaved rounds with the engine order rotated every round.
+    #    interleaved rounds with the engine order rotated every round. Every
+    #    run is logged with free memory, so a slowdown can be pinned on one
+    #    engine, one query, or the VM as a whole.
+    def run_logged(label, q, n, argv):
+        dt = timed(argv)
+        shown = "FAILED" if dt is None else f"{dt:7.2f}s"
+        print(f"  {label:>7} {q} {n:<18} {shown}  free={free_mb()} MB", flush=True)
+        return dt
+
     for q, cq, dq in qs:
-        for kind, exe in engines.values():
-            subprocess.run(argv_for(kind, exe, cq, dq), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for n, (kind, exe) in engines.items():
+            run_logged("warm-up", q, n, argv_for(kind, exe, cq, dq))
     for r in range(a.rounds):
         order = names[r % len(names):] + names[:r % len(names)]
         for q, cq, dq in qs:
             for n in order:
                 kind, exe = engines[n]
-                res["queries"][q]["times"][n].append(timed(argv_for(kind, exe, cq, dq)))
+                res["queries"][q]["times"][n].append(run_logged(f"round {r + 1}", q, n, argv_for(kind, exe, cq, dq)))
         print(f"round {r + 1}/{a.rounds} done", flush=True)
 
+    failed = False
     for q, r in res["queries"].items():
-        r["median"] = {n: statistics.median(t) for n, t in r["times"].items()}
-        r["ratio"] = {n: r["median"][n] / r["median"]["csvql"] for n in names if n != "csvql"}
+        ok = {n: [t for t in ts if t is not None] for n, ts in r["times"].items()}
+        failed |= any(len(v) < len(r["times"][n]) for n, v in ok.items())
+        r["median"] = {n: statistics.median(v) if v else None for n, v in ok.items()}
+        r["ratio"] = {n: r["median"][n] / r["median"]["csvql"]
+                      for n in names if n != "csvql" and r["median"][n] and r["median"]["csvql"]}
 
     table = md_table(res)
     print("\n" + table)
@@ -231,7 +278,7 @@ def cmd_run(a):
     if summary:
         with open(summary, "a", encoding="utf-8") as f:
             f.write(table + "\n\n")
-    if not all(all(r["match"].values()) for r in res["queries"].values()):
+    if failed or not all(all(r["match"].values()) for r in res["queries"].values()):
         sys.exit(1)
 
 
@@ -255,6 +302,9 @@ def cmd_aggregate(a):
         for e in engines:
             if not all(r["queries"][q]["match"].get(e, False) for r in runs):
                 row += ["MISMATCH on ≥1 VM", "—"]
+                continue
+            if not all(e in r["queries"][q].get("ratio", {}) for r in runs):
+                row += ["FAILED on ≥1 VM", "—"]
                 continue
             vals = [r["queries"][q]["ratio"][e] for r in runs]
             spread = (max(vals) - min(vals)) / statistics.median(vals) * 100
