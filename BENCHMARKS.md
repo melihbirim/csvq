@@ -23,6 +23,21 @@ DuckDB and DataFusion CLIs default to displaying only 40 rows, making them appea
 
 **35x less memory** than DuckDB (1.8MB vs 63.5MB).
 
+## GROUP BY by cardinality (csvql only)
+
+**20M rows, 324 to 424 MB CSV, Apple M4 Max (14 cores)**, `> /dev/null`, median of 5 runs, via [`bench/bench_groupby_cardinality.sh`](bench/bench_groupby_cardinality.sh). The script generates its own data and is not run by CI. "high" draws 10M keys with replacement, which gives 5.7M distinct groups.
+
+| Query                           | Keys (distinct) | 1 thread | 14 threads |
+| ------------------------------- | --------------- | -------- | ---------- |
+| `COUNT(*)`                      | 100             | 0.49s    | 0.05s      |
+| `COUNT(*), SUM, AVG`            | 100             | 0.61s    | 0.07s      |
+| `COUNT(*)`                      | 100,000         | 0.69s    | 0.31s      |
+| `COUNT(*), SUM, AVG`            | 100,000         | 0.96s    | 0.43s      |
+| `COUNT(*)`                      | 5.7M            | 4.12s    | 2.18s      |
+| `COUNT(*), SUM, AVG`            | 5.7M            | 4.55s    | 2.81s      |
+
+At 5.7M groups, most of the time was outside the scan. Phase timings at 14 threads for `COUNT(*), SUM, AVG`: scan 2.0s, sorting the group keys 3.1s, writing the rows 1.7s. Sorting compared pointers into scattered key storage; it now sorts an array that carries the first eight key bytes and the accumulator pointer (0.45s and 0.75s). The shared map now uses at least 64 shards instead of one per thread, which cut the scan phase from about 2.0s to 1.6s. The same query took 6.93s at 14 threads and 8.31s at 1 thread before those two changes.
+
 ## Output-format throughput
 
 **2M rows, 56 MB CSV, Apple M2 Pro** — full output, all rows, via [`bench/bench_all.sh --section formats`](bench/bench_all.sh):

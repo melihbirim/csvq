@@ -4549,6 +4549,50 @@ fn foldPartialGroup(
     }
 }
 
+/// One output group: its key, its accumulator, and the first eight bytes of the
+/// key as a big-endian integer so most comparisons in `sortGroups` never leave
+/// the array being sorted.
+const SortedGroup = struct {
+    prefix: u64,
+    key: []const u8,
+    accum: *CompactAccum,
+
+    fn init(key: []const u8, accum: *CompactAccum) SortedGroup {
+        var buf = [_]u8{0} ** 8;
+        const n = @min(key.len, buf.len);
+        @memcpy(buf[0..n], key[0..n]);
+        return .{ .prefix = std.mem.readInt(u64, &buf, .big), .key = key, .accum = accum };
+    }
+
+    /// Byte-wise lexicographic order on the key, identical to `std.mem.order`.
+    /// Zero padding makes the prefix comparison agree with it; equal prefixes
+    /// (including a short key against a longer one that starts with it) fall
+    /// back to the full comparison.
+    fn lessThan(_: void, a: SortedGroup, b: SortedGroup) bool {
+        if (a.prefix != b.prefix) return a.prefix < b.prefix;
+        return std.mem.order(u8, a.key, b.key) == .lt;
+    }
+};
+
+/// Sort output groups by key. With millions of groups this was the largest
+/// single phase of a high-cardinality GROUP BY: every comparison chased two
+/// pointers into key storage scattered across the shard arenas, and each of
+/// those was a cache miss. Carrying the accumulator pointer also spares the
+/// emit loop a second hash lookup per group.
+fn sortGroups(groups: []SortedGroup) void {
+    std.sort.pdq(SortedGroup, groups, {}, SortedGroup.lessThan);
+}
+
+test "sortGroups matches byte-wise order, including short keys and shared prefixes" {
+    var accum: CompactAccum = undefined; // never dereferenced
+    const input = [_][]const u8{ "b", "abcdefgh2", "", "abcdefgh", "ab", "ab\x00", "abcdefgh10", "a", "\xff", "abcdefg", "abcdefgh1" };
+    const expected = [_][]const u8{ "", "a", "ab", "ab\x00", "abcdefg", "abcdefgh", "abcdefgh1", "abcdefgh10", "abcdefgh2", "b", "\xff" };
+    var groups: [input.len]SortedGroup = undefined;
+    for (input, &groups) |k, *g| g.* = SortedGroup.init(k, &accum);
+    sortGroups(&groups);
+    for (expected, groups) |e, g| try std.testing.expectEqualStrings(e, g.key);
+}
+
 /// Which merge shard owns a key. Hash, not range, so groups spread evenly no
 /// matter what the key values look like.
 fn mergeShardOf(key: []const u8, n_shards: usize) usize {
@@ -4584,6 +4628,16 @@ const SharedGroups = struct {
         return &self.shards[mergeShardOf(key, self.shards.len)];
     }
 };
+
+/// Fewest shards the shared map is split into, however few threads run.
+///
+/// One shard per thread meant two workers routinely wanted the same lock:
+/// at 14 threads on 20M rows and 5.7M distinct keys, `sample` showed about a
+/// quarter of all worker time parked in `__ulock_wait2`. Sweeping the shard
+/// count there (scan phase, median of 4 runs) gave 14: 2.0s, 32: 1.8s, 48: 1.7s,
+/// 64: 1.6s, 96: 1.5s, 128: 1.6s, 256: 1.8s, 1024: 3.3s, so more shards help
+/// until the per-shard tables stop fitting the cache.
+const min_merge_shards: usize = 64;
 
 /// A worker keeps its own map until it holds this many groups. Low-cardinality
 /// GROUP BY never reaches it and never takes a lock.
@@ -5938,7 +5992,7 @@ fn executeGroupBy(
         // per-group allocation and the serial merge.
         // Shards the workers may spill into once their own maps get large, and
         // the destination the leftover local maps fold into afterwards.
-        merge_shards = try allocator.alloc(MergeShard, n_threads);
+        merge_shards = try allocator.alloc(MergeShard, @max(n_threads, min_merge_shards));
         for (merge_shards.?) |*sh| {
             sh.* = .{
                 .map = std.StringHashMap(CompactAccum).init(allocator),
@@ -6194,25 +6248,21 @@ fn executeGroupBy(
         break :blk t;
     } else group_map.count();
 
-    var sorted_keys = try allocator.alloc([]const u8, total_groups);
-    defer allocator.free(sorted_keys);
+    const sorted_groups = try allocator.alloc(SortedGroup, total_groups);
+    defer allocator.free(sorted_groups);
     {
-        var ki: usize = 0;
+        var gi: usize = 0;
         if (merge_shards) |shards| {
             for (shards) |*sh| {
-                var kit = sh.map.keyIterator();
-                while (kit.next()) |k| : (ki += 1) sorted_keys[ki] = k.*;
+                var it = sh.map.iterator();
+                while (it.next()) |e| : (gi += 1) sorted_groups[gi] = SortedGroup.init(e.key_ptr.*, e.value_ptr);
             }
         } else {
-            var kit = group_map.keyIterator();
-            while (kit.next()) |k| : (ki += 1) sorted_keys[ki] = k.*;
+            var it = group_map.iterator();
+            while (it.next()) |e| : (gi += 1) sorted_groups[gi] = SortedGroup.init(e.key_ptr.*, e.value_ptr);
         }
     }
-    std.mem.sort([]const u8, sorted_keys, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
-        }
-    }.lt);
+    sortGroups(sorted_groups);
 
     var output_row = try allocator.alloc([]const u8, col_kinds.items.len);
     defer allocator.free(output_row);
@@ -6259,12 +6309,9 @@ fn executeGroupBy(
 
     var rows_output: i32 = 0;
     var rows_skipped: i32 = 0;
-    for (sorted_keys) |key| {
+    for (sorted_groups) |group| {
         if (query.order_by == null and query.limit >= 0 and rows_output >= query.limit) break;
-        const accum = if (merge_shards) |shards|
-            shards[mergeShardOf(key, shards.len)].map.getPtr(key).?
-        else
-            group_map.getPtr(key).?;
+        const accum = group.accum;
 
         // Per-row scratch arena, reset once at the top of each iteration:
         // aggregate formatting below and column/scalar formatting further
@@ -9838,4 +9885,66 @@ test "OFFSET skips GROUP BY output before applying LIMIT" {
     defer allocator.free(out);
 
     try std.testing.expectEqualStrings("department,count\nMarketing,1\n", out);
+}
+
+test "GROUP BY: high-cardinality result is complete and in key order at any thread count" {
+    // Big enough to take the parallel path (> 10 MiB) with every worker seeing
+    // more than shared_groups_threshold distinct keys, so groups are built in the
+    // sharded shared map and the sorted output reads them from there.
+    const allocator = std.testing.allocator;
+    const n_rows: usize = 800_000;
+    const n_keys: usize = 80_000;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        var buf: [64 * 1024]u8 = undefined;
+        var w = f.writer(&buf);
+        try w.interface.writeAll("id,key,amount\n");
+        for (0..n_rows) |i| try w.interface.print("{d},key-{d},{d}\n", .{ i, i % n_keys, i % 100 });
+        try w.interface.flush();
+    }
+
+    // Independent expectation: keys sorted as bytes, integer sums (exact in f64).
+    const sums = try allocator.alloc(u64, n_keys);
+    defer allocator.free(sums);
+    @memset(sums, 0);
+    for (0..n_rows) |i| sums[i % n_keys] += i % 100;
+
+    const order = try allocator.alloc(usize, n_keys);
+    defer allocator.free(order);
+    for (order, 0..) |*o, i| o.* = i;
+    var name_buf: [2][32]u8 = undefined;
+    const KeyOrder = struct {
+        fn lessThan(names: *[2][32]u8, a: usize, b: usize) bool {
+            const sa = std.fmt.bufPrint(&names[0], "key-{d}", .{a}) catch unreachable;
+            const sb = std.fmt.bufPrint(&names[1], "key-{d}", .{b}) catch unreachable;
+            return std.mem.order(u8, sa, sb) == .lt;
+        }
+    };
+    std.mem.sort(usize, order, &name_buf, KeyOrder.lessThan);
+
+    var expected: std.Io.Writer.Allocating = .init(allocator);
+    defer expected.deinit();
+    try expected.writer.writeAll("key,count,total\n");
+    for (order) |k| try expected.writer.print("key-{d},{d},{d}\n", .{ k, n_rows / n_keys, sums[k] });
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+    const sql = try std.fmt.allocPrint(allocator, "SELECT key, COUNT(*) AS count, SUM(amount) AS total FROM '{s}' GROUP BY key", .{in_path});
+    defer allocator.free(sql);
+
+    for ([_]usize{ 1, 4 }) |threads| {
+        var query = try parser.parse(allocator, sql);
+        defer query.deinit();
+        const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+        defer out_file.close();
+        try execute(allocator, query, out_file, .{ .threads = threads });
+        try out_file.seekTo(0);
+        const out = try out_file.readToEndAlloc(allocator, 16 * 1024 * 1024);
+        defer allocator.free(out);
+        try std.testing.expect(std.mem.eql(u8, expected.written(), out));
+    }
 }
