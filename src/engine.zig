@@ -2718,6 +2718,7 @@ const OptionalSlots = struct {
     values: ?[]?std.ArrayList(f64) = null,
     concat: ?[]?std.ArrayList([]const u8) = null,
     means: ?[]f64 = null,
+    sum_comps: ?[]f64 = null,
 
     /// Build the shared all-null arrays for whichever kinds `specs` never uses.
     fn forSpecs(ka: Allocator, specs: []const AggSpec, n_aggs: usize) !OptionalSlots {
@@ -2725,11 +2726,13 @@ const OptionalSlots = struct {
         var needs_values = false;
         var needs_concat = false;
         var needs_means = false;
+        var needs_comps = false;
         for (specs) |spec| switch (spec.func_type) {
             .count_distinct => needs_distinct = true,
             .median => needs_values = true,
             .group_concat => needs_concat = true,
             .variance, .stddev, .variance_samp, .stddev_samp => needs_means = true,
+            .sum, .avg => needs_comps = true,
             else => {},
         };
         var opt = OptionalSlots{};
@@ -2753,6 +2756,11 @@ const OptionalSlots = struct {
             @memset(m, 0.0);
             opt.means = m;
         }
+        if (!needs_comps) {
+            const c = try ka.alloc(f64, n_aggs);
+            @memset(c, 0.0);
+            opt.sum_comps = c;
+        }
         return opt;
     }
 };
@@ -2763,6 +2771,7 @@ const CompactAccum = struct {
     sums: []f64, // sum[i] for agg_spec i, arena-alloc, zero-init
     sum_sqs: []f64, // Welford M2[i] for VARIANCE/STDDEV, arena-alloc, zero-init
     means: []f64, // Welford running mean[i], only written when a variance/stddev agg exists
+    sum_comps: []f64, // Neumaier compensation term for sums[i], only written when a SUM/AVG agg exists
     sum_counts: []i64, // non-null input count per agg (for AVG), arena-alloc
     mins: []f64, // min[i], arena-alloc, init to +inf
     maxs: []f64, // max[i], arena-alloc, init to -inf
@@ -2794,6 +2803,11 @@ const CompactAccum = struct {
             @memset(m, 0.0);
             break :blk m;
         };
+        const sum_comps = opt.sum_comps orelse blk: {
+            const c = try ka.alloc(f64, n_aggs);
+            @memset(c, 0.0);
+            break :blk c;
+        };
         const concat_lists = opt.concat orelse blk: {
             const c = try ka.alloc(?std.ArrayList([]const u8), n_aggs);
             for (c) |*cl| cl.* = null;
@@ -2812,6 +2826,7 @@ const CompactAccum = struct {
             .sums = sums,
             .sum_sqs = sum_sqs,
             .means = means,
+            .sum_comps = sum_comps,
             .sum_counts = sum_counts,
             .mins = mins,
             .maxs = maxs,
@@ -3357,6 +3372,36 @@ fn fmtGroupConcat(allocator: Allocator, cl: ?std.ArrayList([]const u8), sep: []c
 /// True for the aggregates that need Welford state rather than a plain sum.
 inline fn needsVariance(t: aggregation.AggregateType) bool {
     return t == .variance or t == .stddev or t == .variance_samp or t == .stddev_samp;
+}
+
+/// Add `val` to the running total for slot `i` with Neumaier's compensated
+/// summation. `sums[i]` holds the rounded total and `comps[i]` the low-order
+/// bits each addition would otherwise have discarded.
+///
+/// A plain `+=` makes the result depend on the order of the additions, and the
+/// parallel path adds in a different order from the sequential one (each worker
+/// sums its own chunk, then the partials are added), so the last digits moved
+/// with --threads (#185). Carrying the rounding error keeps every partial sum
+/// close to exact, so the totals agree however the rows are split.
+inline fn sumAdd(sums: []f64, comps: []f64, i: usize, val: f64) void {
+    const s = sums[i];
+    const t = s + val;
+    comps[i] += if (@abs(s) >= @abs(val)) (s - t) + val else (val - t) + s;
+    sums[i] = t;
+}
+
+/// Fold a worker's compensated partial (`src_sum`, `src_comp`) into slot `i`.
+inline fn sumMerge(sums: []f64, comps: []f64, src_sum: f64, src_comp: f64, i: usize) void {
+    sumAdd(sums, comps, i, src_sum);
+    comps[i] += src_comp;
+}
+
+/// The final total for slot `i`. The compensation term is NaN whenever the
+/// running sum overflowed to infinity (inf - inf), so fall back to the plain
+/// sum in that case to keep SUM returning inf/nan as before.
+inline fn sumTotal(sums: []const f64, comps: []const f64, i: usize) f64 {
+    const r = sums[i] + comps[i];
+    return if (std.math.isFinite(r)) r else sums[i];
 }
 
 /// One Welford step for slot `i`. Call AFTER sum_counts[i] has been incremented
@@ -4066,7 +4111,7 @@ fn executeScalarAgg(
             const partial = &ctx.partial_accum;
             accum.count += partial.count;
             for (0..n_aggs) |i| {
-                accum.sums[i] += partial.sums[i];
+                sumMerge(accum.sums, accum.sum_comps, partial.sums[i], partial.sum_comps[i], i);
                 welfordMerge(&accum.means[i], &accum.sum_sqs[i], accum.sum_counts[i], partial.means[i], partial.sum_sqs[i], partial.sum_counts[i]);
                 accum.sum_counts[i] += partial.sum_counts[i];
                 if (partial.mins[i] < accum.mins[i]) accum.mins[i] = partial.mins[i];
@@ -4188,13 +4233,13 @@ fn executeScalarAgg(
                         if (spec.case_when) |cw| {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                             const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
-                            accum.sums[i] += val;
+                            if (!needsVariance(spec.func_type)) sumAdd(accum.sums, accum.sum_comps, i, val);
                             accum.sum_counts[i] += 1;
                             if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
                         } else if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
-                                    accum.sums[i] += val;
+                                    if (!needsVariance(spec.func_type)) sumAdd(accum.sums, accum.sum_comps, i, val);
                                     accum.sum_counts[i] += 1;
                                     if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
                                 } else |_| {}
@@ -4250,14 +4295,14 @@ fn executeScalarAgg(
                 // SQL semantics: SUM over zero matching rows is NULL, not 0 (issue #104).
                 // COUNT is the only aggregate where "no rows" and "0" coincide.
                 break :blk if (accum.sum_counts[i] > 0)
-                    try fmtAggrF64(allocator, accum.sums[i], spec.round_digits)
+                    try fmtAggrF64(allocator, sumTotal(accum.sums, accum.sum_comps, i), spec.round_digits)
                 else
                     try allocator.dupe(u8, "");
             },
             .avg => blk: {
                 const cnt = accum.sum_counts[i];
                 break :blk if (cnt > 0)
-                    try fmtAggrF64(allocator, accum.sums[i] / @as(f64, @floatFromInt(cnt)), spec.round_digits)
+                    try fmtAggrF64(allocator, sumTotal(accum.sums, accum.sum_comps, i) / @as(f64, @floatFromInt(cnt)), spec.round_digits)
                 else
                     try allocator.dupe(u8, "");
             },
@@ -4506,6 +4551,7 @@ fn foldPartialGroup(
             .key_values = key_vals,
             .count = partial.count,
             .sums = try ka.dupe(f64, partial.sums),
+            .sum_comps = try ka.dupe(f64, partial.sum_comps),
             .sum_sqs = try ka.dupe(f64, partial.sum_sqs),
             .means = try ka.dupe(f64, partial.means),
             .sum_counts = try ka.dupe(i64, partial.sum_counts),
@@ -4520,7 +4566,7 @@ fn foldPartialGroup(
         const accum = gop.value_ptr;
         accum.count += partial.count;
         for (0..n_aggs) |i| {
-            accum.sums[i] += partial.sums[i];
+            sumMerge(accum.sums, accum.sum_comps, partial.sums[i], partial.sum_comps[i], i);
             welfordMerge(&accum.means[i], &accum.sum_sqs[i], accum.sum_counts[i], partial.means[i], partial.sum_sqs[i], partial.sum_counts[i]);
             accum.sum_counts[i] += partial.sum_counts[i];
             if (partial.mins[i] < accum.mins[i]) accum.mins[i] = partial.mins[i];
@@ -4688,13 +4734,13 @@ fn gbApplyAggs(ctx: *GbWorkerCtx, aa: Allocator, accum: *CompactAccum, record: [
                 if (spec.case_when) |cw| {
                     const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                     const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
-                    accum.sums[i] += val;
+                    if (!needsVariance(spec.func_type)) sumAdd(accum.sums, accum.sum_comps, i, val);
                     accum.sum_counts[i] += 1;
                     if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
                 } else if (spec.col_idx) |cidx| {
                     if (cidx < record.len) {
                         if (parseNumericFast(record[cidx])) |val| {
-                            accum.sums[i] += val;
+                            if (!needsVariance(spec.func_type)) sumAdd(accum.sums, accum.sum_comps, i, val);
                             accum.sum_counts[i] += 1;
                             if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
                         } else |_| {}
@@ -5293,13 +5339,13 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                         if (spec.case_when) |cw| {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                             const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
-                            ctx.partial_accum.sums[i] += val;
+                            if (!needsVariance(spec.func_type)) sumAdd(ctx.partial_accum.sums, ctx.partial_accum.sum_comps, i, val);
                             ctx.partial_accum.sum_counts[i] += 1;
                             if (needsVariance(spec.func_type)) welfordAdd(ctx.partial_accum.means, ctx.partial_accum.sum_sqs, ctx.partial_accum.sum_counts[i], i, val);
                         } else if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
-                                    ctx.partial_accum.sums[i] += val;
+                                    if (!needsVariance(spec.func_type)) sumAdd(ctx.partial_accum.sums, ctx.partial_accum.sum_comps, i, val);
                                     ctx.partial_accum.sum_counts[i] += 1;
                                     if (needsVariance(spec.func_type)) welfordAdd(ctx.partial_accum.means, ctx.partial_accum.sum_sqs, ctx.partial_accum.sum_counts[i], i, val);
                                 } else |_| {}
@@ -5411,13 +5457,13 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                         if (spec.case_when) |cw| {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                             const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
-                            ctx.partial_accum.sums[i] += val;
+                            if (!needsVariance(spec.func_type)) sumAdd(ctx.partial_accum.sums, ctx.partial_accum.sum_comps, i, val);
                             ctx.partial_accum.sum_counts[i] += 1;
                             if (needsVariance(spec.func_type)) welfordAdd(ctx.partial_accum.means, ctx.partial_accum.sum_sqs, ctx.partial_accum.sum_counts[i], i, val);
                         } else if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
-                                    ctx.partial_accum.sums[i] += val;
+                                    if (!needsVariance(spec.func_type)) sumAdd(ctx.partial_accum.sums, ctx.partial_accum.sum_comps, i, val);
                                     ctx.partial_accum.sum_counts[i] += 1;
                                     if (needsVariance(spec.func_type)) welfordAdd(ctx.partial_accum.means, ctx.partial_accum.sum_sqs, ctx.partial_accum.sum_counts[i], i, val);
                                 } else |_| {}
@@ -6150,13 +6196,13 @@ fn executeGroupBy(
                         if (spec.case_when) |cw| {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                             const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
-                            accum.sums[i] += val;
+                            if (!needsVariance(spec.func_type)) sumAdd(accum.sums, accum.sum_comps, i, val);
                             accum.sum_counts[i] += 1;
                             if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
                         } else if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
-                                    accum.sums[i] += val;
+                                    if (!needsVariance(spec.func_type)) sumAdd(accum.sums, accum.sum_comps, i, val);
                                     accum.sum_counts[i] += 1;
                                     if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
                                 } else |_| {}
@@ -6297,14 +6343,14 @@ fn executeGroupBy(
                 .sum => blk: {
                     // SQL semantics: SUM over zero matching rows is NULL, not 0 (issue #104).
                     break :blk if (accum.sum_counts[i] > 0)
-                        try fmtAggrF64(sra, accum.sums[i], spec.round_digits)
+                        try fmtAggrF64(sra, sumTotal(accum.sums, accum.sum_comps, i), spec.round_digits)
                     else
                         try sra.dupe(u8, "");
                 },
                 .avg => blk: {
                     const cnt = accum.sum_counts[i];
                     break :blk if (cnt > 0)
-                        try fmtAggrF64(sra, accum.sums[i] / @as(f64, @floatFromInt(cnt)), spec.round_digits)
+                        try fmtAggrF64(sra, sumTotal(accum.sums, accum.sum_comps, i) / @as(f64, @floatFromInt(cnt)), spec.round_digits)
                     else
                         try sra.dupe(u8, "");
                 },
@@ -6450,6 +6496,10 @@ fn executeGroupBy(
 
 // Run `sql` against `csv_content` and return the output (caller frees).
 fn runQueryForTest(allocator: Allocator, tmp: *std.testing.TmpDir, csv_content: []const u8, sql_tmpl: []const u8) ![]u8 {
+    return runQueryForTestOpts(allocator, tmp, csv_content, sql_tmpl, .{});
+}
+
+fn runQueryForTestOpts(allocator: Allocator, tmp: *std.testing.TmpDir, csv_content: []const u8, sql_tmpl: []const u8, opts: options_mod.Options) ![]u8 {
     {
         const f = try tmp.dir.createFile("input.csv", .{});
         defer f.close();
@@ -6463,7 +6513,7 @@ fn runQueryForTest(allocator: Allocator, tmp: *std.testing.TmpDir, csv_content: 
     defer query.deinit();
     const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
     defer out_file.close();
-    try execute(allocator, query, out_file, .{});
+    try execute(allocator, query, out_file, opts);
     try out_file.seekTo(0);
     return out_file.readToEndAlloc(allocator, 64 * 1024);
 }
@@ -6590,6 +6640,66 @@ test "VARIANCE / STDDEV: sample is undefined (empty) for a single-row group" {
     const out = try runQueryForTest(allocator, &tmp, data, "SELECT STDDEV(v) AS s FROM '{s}'");
     defer allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "s\n\n") != null or std.mem.endsWith(u8, std.mem.trim(u8, out, "\n"), "s"));
+}
+
+test "SUM / AVG: result does not depend on --threads (#185)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Above the 10 MB threshold so the parallel scan is used. Amounts are exact
+    // cents, so the true group totals are known integers: with a plain f64 `+=`
+    // the parallel merge adds them in a different order from the sequential
+    // scan and the last digits differ (e.g. 124997499.99999999 vs 124997500).
+    const n_rows: usize = 700_000;
+    const n_groups = 4;
+    var cents = [_]u64{0} ** n_groups;
+    var counts = [_]u64{0} ** n_groups;
+    var data = std.ArrayList(u8){};
+    defer data.deinit(allocator);
+    try data.appendSlice(allocator, "id,g,x\n");
+    var line: [64]u8 = undefined;
+    for (0..n_rows) |i| {
+        const c: u64 = (i * 37) % 100_000;
+        const g = i % n_groups;
+        cents[g] += c;
+        counts[g] += 1;
+        const row = try std.fmt.bufPrint(&line, "{d},g{d},{d}.{d:0>2}\n", .{ i, g, c / 100, c % 100 });
+        try data.appendSlice(allocator, row);
+    }
+    try std.testing.expect(data.items.len > 10 * 1024 * 1024);
+
+    const sql = "SELECT g, SUM(x), AVG(x) FROM '{s}' GROUP BY g ORDER BY g";
+    const scalar_sql = "SELECT SUM(x), AVG(x) FROM '{s}'";
+
+    const seq = try runQueryForTestOpts(allocator, &tmp, data.items, sql, .{ .threads = 1 });
+    defer allocator.free(seq);
+    const seq_scalar = try runQueryForTestOpts(allocator, &tmp, data.items, scalar_sql, .{ .threads = 1 });
+    defer allocator.free(seq_scalar);
+
+    // The sequential answer must itself be the correctly rounded total.
+    var expected = std.ArrayList(u8){};
+    defer expected.deinit(allocator);
+    try expected.appendSlice(allocator, "g,SUM(x),AVG(x)\n");
+    for (0..n_groups) |g| {
+        const total = @as(f64, @floatFromInt(cents[g])) / 100.0;
+        const sum_s = try formatF64(allocator, total);
+        defer allocator.free(sum_s);
+        const avg_s = try formatF64(allocator, total / @as(f64, @floatFromInt(counts[g])));
+        defer allocator.free(avg_s);
+        try expected.writer(allocator).print("g{d},{s},{s}\n", .{ g, sum_s, avg_s });
+    }
+    try std.testing.expectEqualStrings(expected.items, seq);
+
+    for ([_]usize{ 2, 3, 4, 7 }) |threads| {
+        const par = try runQueryForTestOpts(allocator, &tmp, data.items, sql, .{ .threads = threads });
+        defer allocator.free(par);
+        try std.testing.expectEqualStrings(seq, par);
+
+        const par_scalar = try runQueryForTestOpts(allocator, &tmp, data.items, scalar_sql, .{ .threads = threads });
+        defer allocator.free(par_scalar);
+        try std.testing.expectEqualStrings(seq_scalar, par_scalar);
+    }
 }
 
 test "--no-input-header: first row is data, columns named c1..cN" {
