@@ -1,0 +1,141 @@
+name: Bench vs DuckDB versions
+
+# Manual, on-demand: does a new DuckDB build narrow csvql's raw-CSV lead?
+# Runs csvql, the pinned DuckDB (bench/DUCKDB_VERSION) and a candidate build
+# side by side on the SAME VM, interleaved, median of N rounds, answers checked
+# against csvql first. Three VMs per dispatch so the ratio spread shows whether
+# the signal is real. Shared runners are noisy: read the ratios, not the seconds,
+# and don't publish absolute numbers from here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_url:
+        description: "Candidate DuckDB CLI zip URL for the chosen OS (e.g. the v2.0 alpha duckdb_cli-windows-amd64.zip)"
+        required: true
+      candidate_name:
+        description: "Label for the candidate in the report"
+        required: false
+        default: "duckdb-2.0-alpha"
+      os:
+        description: "Runner OS"
+        type: choice
+        options: [windows-latest, ubuntu-latest, macos-14]
+        default: windows-latest
+      scale:
+        description: "sample = 1M rows (~417 MB); full = trips_xaa (20M rows, ~8 GB)"
+        type: choice
+        options: [sample, full]
+        default: sample
+      rounds:
+        description: "Interleaved rounds per VM (median reported)"
+        required: false
+        default: "5"
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: Bench (VM ${{ matrix.vm }})
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        vm: [1, 2, 3]
+    defaults:
+      run:
+        shell: bash
+    env:
+      EXE: ${{ inputs.os == 'windows-latest' && '.exe' || '' }}
+      CANDIDATE_URL: ${{ inputs.candidate_url }}
+      CANDIDATE_NAME: ${{ inputs.candidate_name }}
+      SCALE: ${{ inputs.scale }}
+      ROUNDS: ${{ inputs.rounds }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: 0.15.2
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Build csvql (ReleaseFast)
+      run: zig build -Doptimize=ReleaseFast
+
+    - name: Install DuckDB builds
+      run: |
+        case "$RUNNER_OS" in
+          Windows) asset=duckdb_cli-windows-amd64.zip ;;
+          Linux)   asset=duckdb_cli-linux-amd64.zip ;;
+          macOS)   asset=duckdb_cli-osx-universal.zip ;;
+        esac
+        export PINNED_URL="https://github.com/duckdb/duckdb/releases/download/v$(cat bench/DUCKDB_VERSION)/${asset}"
+        # Python, not find/unzip: RUNNER_TEMP is a Windows path under Git Bash,
+        # the alpha may ship as .zip or .tar.gz, and may nest the binary.
+        python - <<'PY'
+        import os, pathlib, shutil, stat, subprocess, urllib.request
+        tmp, exe = pathlib.Path(os.environ["RUNNER_TEMP"]), "duckdb" + os.environ["EXE"]
+        with open(os.environ["GITHUB_ENV"], "a") as env:
+            for name, url in (("PINNED", os.environ["PINNED_URL"]), ("CANDIDATE", os.environ["CANDIDATE_URL"])):
+                archive = tmp / url.rstrip("/").rsplit("/", 1)[-1]
+                urllib.request.urlretrieve(url, archive)
+                dest = tmp / f"duck-{name.lower()}"
+                shutil.unpack_archive(archive, dest)
+                bins = [p for p in dest.rglob(exe) if p.is_file()]
+                if not bins:
+                    raise SystemExit(f"no {exe} in {url}")
+                b = bins[0]
+                b.chmod(b.stat().st_mode | stat.S_IEXEC)
+                print(name, b, subprocess.run([b, "--version"], capture_output=True, text=True).stdout.strip())
+                env.write(f"DUCK_{name}={b}\n")
+        PY
+
+    - name: Fetch taxi data
+      run: python bench/bench_taxi_versions.py fetch --out "$RUNNER_TEMP/taxi" $([ "$SCALE" = full ] && echo --full)
+
+    - name: Run benchmark
+      run: |
+        csv="$RUNNER_TEMP/taxi/$([ "$SCALE" = full ] && echo trips.csv || echo sample.csv)"
+        python bench/bench_taxi_versions.py run \
+          --csv "$csv" \
+          --csvql "zig-out/bin/csvql$EXE" \
+          --engine "duckdb-$(cat bench/DUCKDB_VERSION)=$DUCK_PINNED" \
+          --engine "$CANDIDATE_NAME=$DUCK_CANDIDATE" \
+          --rounds "$ROUNDS" \
+          --json "result-vm${{ matrix.vm }}.json"
+
+    - name: Upload result
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: result-vm${{ matrix.vm }}
+        path: result-vm${{ matrix.vm }}.json
+        if-no-files-found: ignore
+
+  aggregate:
+    name: Ratio stability across VMs
+    needs: bench
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download results
+      uses: actions/download-artifact@v4
+      with:
+        pattern: result-vm*
+        merge-multiple: true
+        path: results
+
+    - name: Aggregate
+      run: python3 bench/bench_taxi_versions.py aggregate results/*.json
