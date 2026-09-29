@@ -102,7 +102,18 @@ The sample flatters csvql, because on small files DuckDB's startup cost is a lar
 
 The spread between VMs was 0–1%: the Linux runners are much steadier than the Windows ones.
 
-**Windows** (`windows-latest`): the 8 GB run was still in progress when this post went up. The table will be added here once it finishes.
+**Windows** (`windows-latest`), 3 rounds per VM:
+
+| Query | vs DuckDB 1.5.5 | vs DuckDB 2.0 alpha |
+|---|---|---|
+| Q01 | 4.76–4.99x | 3.64–3.81x |
+| Q02 | 4.42–4.70x | 3.43–3.60x |
+| Q03 | 2.56–2.72x | 2.01–2.15x |
+| Q04 | 2.38–2.55x | 1.87–2.03x |
+
+Spread across VMs was 4–8%. On one VM, csvql took 2.5–5.2 s per query, DuckDB 1.5.5 took 12.4–13.4 s and the alpha 9.7–10.6 s. By the time this run happened, the rolling alpha link was serving `v2.0.0-alpha43678`.
+
+Getting this table took two tries. The first Windows 8 GB run needed 34 minutes for a single round and then crashed. Logging every run showed why: the harness sent each engine's output to Windows' `NUL` device, and in that setup the DuckDB 2.0 alpha took 110–130 s per query instead of about 10 s. Whichever engine ran next was slowed too, most likely because the cached file had been dropped: csvql went from 2.5 s to about 21 s. Reading the output through a pipe instead made all three engines stable. That looks like a bug in the alpha, not something to benchmark, so the harness now always uses a pipe.
 
 ---
 
@@ -113,6 +124,7 @@ On these raw-CSV queries, measured on the same machines, the v2.0 alpha is faste
 - **~18% on Windows** (1M-row sample, Q01)
 - **~11% on Linux** (1M-row sample, Q01)
 - **~14% on Linux** (8 GB file, Q01: 8.09 s → 6.95 s)
+- **~22% on Windows** (8 GB file, Q01: 12.44 s → 9.67 s)
 
 That's a real improvement, and it narrows csvql's lead. It is nowhere near 6x, and it isn't supposed to be: the 6x claim is about TPC-H on loaded data, a different workload. The two numbers don't contradict each other. They measure different things.
 

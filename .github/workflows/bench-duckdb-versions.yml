@@ -31,11 +31,6 @@ on:
         description: "Interleaved rounds per VM (median reported)"
         required: false
         default: "5"
-      stdout_mode:
-        description: "Where timed runs send stdout: pipe (read and discard) or devnull (the OS null device)"
-        type: choice
-        options: [pipe, devnull]
-        default: pipe
 
 permissions:
   contents: read
@@ -58,7 +53,6 @@ jobs:
       CANDIDATE_NAME: ${{ inputs.candidate_name }}
       SCALE: ${{ inputs.scale }}
       ROUNDS: ${{ inputs.rounds }}
-      STDOUT_MODE: ${{ inputs.stdout_mode }}
 
     steps:
     - name: Checkout code
@@ -124,7 +118,6 @@ jobs:
           --engine "duckdb-$(cat bench/DUCKDB_VERSION)=$DUCK_PINNED" \
           --engine "$CANDIDATE_NAME=$DUCK_CANDIDATE" \
           --rounds "$ROUNDS" \
-          --stdout "$STDOUT_MODE" \
           --json "result-vm${{ matrix.vm }}.json"
 
     - name: Upload result

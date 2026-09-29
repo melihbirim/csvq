@@ -160,13 +160,14 @@ def free_mb():
     return None
 
 
-def timed(argv, stdout_mode):
+def timed(argv):
     """Wall time of one run, or None if it failed (stderr tail is printed).
-    stdout_mode "pipe" reads and discards output; "devnull" sends it to the
-    null device, which on Windows some CLIs treat as an interactive console."""
-    out = subprocess.PIPE if stdout_mode == "pipe" else subprocess.DEVNULL
+    Output is read through a pipe and discarded, never sent to the null
+    device: on Windows, DuckDB v2.0.0-alpha ran ~12x slower with stdout on
+    NUL (110-130 s vs ~10 s per 8 GB query) and evicted the page cache for
+    whichever engine ran next."""
     t = time.perf_counter()
-    p = subprocess.run(argv, stdout=out, stderr=subprocess.PIPE)
+    p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     dt = time.perf_counter() - t
     if p.returncode != 0:
         tail = p.stderr.decode(errors="replace").strip()[-500:]
@@ -217,7 +218,6 @@ def cmd_run(a):
         "rows": sum(1 for _ in open(csv, "rb")) - 1,
         "csv_mb": os.path.getsize(csv) / 1e6,
         "rounds": a.rounds,
-        "stdout_mode": a.stdout,
         "engines": names,
         "versions": {n: version_of(exe) for n, (_, exe) in engines.items()},
         "queries": {},
@@ -245,12 +245,11 @@ def cmd_run(a):
     #    run is logged with free memory, so a slowdown can be pinned on one
     #    engine, one query, or the VM as a whole.
     def run_logged(label, q, n, argv):
-        dt = timed(argv, a.stdout)
+        dt = timed(argv)
         shown = "FAILED" if dt is None else f"{dt:7.2f}s"
         print(f"  {label:>7} {q} {n:<18} {shown}  free={free_mb()} MB", flush=True)
         return dt
 
-    print(f"stdout mode: {a.stdout}", flush=True)
     for q, cq, dq in qs:
         for n, (kind, exe) in engines.items():
             run_logged("warm-up", q, n, argv_for(kind, exe, cq, dq))
@@ -330,8 +329,6 @@ def main():
     r.add_argument("--csvql", required=True)
     r.add_argument("--engine", action="append", required=True, help="NAME=PATH to a DuckDB CLI; repeatable")
     r.add_argument("--rounds", type=int, default=5)
-    r.add_argument("--stdout", choices=["pipe", "devnull"], default="pipe",
-                   help="where timed runs send stdout (default: pipe, as in the correctness pass)")
     r.add_argument("--json")
     g = sub.add_parser("aggregate")
     g.add_argument("files", nargs="+")
