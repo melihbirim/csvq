@@ -41,6 +41,11 @@ description: "Notes on building csvql, an analytical CSV query engine for AI age
 </header>
 
 <main class="wrap">
+  <a class="post" href="duckdb-2-on-windows.html">
+    <div class="date">2026-09-29</div>
+    <h2>DuckDB 2.0 Says It's 6x Faster on Windows. I Checked, and Found My Own Engine Was the Slow One.</h2>
+    <p>On raw-CSV queries the DuckDB v2.0 alpha measured 11-18% faster than 1.5.5. The same benchmark showed csvql barely ahead on Windows, because it was copying the whole file into memory first. Fixing that took the Windows lead from 1.3x to 6x.</p>
+  </a>
   <a class="post" href="distinct-values-in-a-10gb-csv.html">
     <div class="date">2026-09-23</div>
     <h2>Five Ways to Find Distinct Values in a 10 GB CSV. One of Them Was Mine, and It Was the Worst.</h2>
