@@ -88,7 +88,8 @@ def cmd_fetch(a):
     tmp = path + ".part"
     # Stream-decompress straight to disk: the .gz never lands, so the full file
     # needs ~8 GB free, not ~10.
-    with urllib.request.urlopen(f"{BLOB}/trips_xaa.csv.gz") as resp, \
+    req = urllib.request.Request(f"{BLOB}/trips_xaa.csv.gz", headers={"User-Agent": "Mozilla/5.0 (csvql-bench)"})
+    with urllib.request.urlopen(req) as resp, \
             gzip.GzipFile(fileobj=resp) as gz, open(tmp, "wb") as out:
         out.write(HEADER.encode() + b"\n")
         if limit is None:
@@ -237,9 +238,9 @@ def cmd_run(a):
 # ── aggregate ────────────────────────────────────────────────────────────────
 
 def cmd_aggregate(a):
-    runs = [json.load(open(p)) for p in a.files]
+    runs = [json.load(open(p)) for p in a.files if os.path.exists(p)]
     if not runs:
-        sys.exit("no result files")
+        sys.exit("no result files: every bench job failed before producing one (see their logs)")
     engines = [e for e in runs[0]["engines"] if e != "csvql"]
     lines = [
         f"### Ratio stability across {len(runs)} VMs (engine/csvql, median per VM)",

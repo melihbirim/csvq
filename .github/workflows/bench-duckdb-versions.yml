@@ -68,9 +68,6 @@ jobs:
       with:
         python-version: "3.12"
 
-    - name: Build csvql (ReleaseFast)
-      run: zig build -Doptimize=ReleaseFast
-
     - name: Install DuckDB builds
       run: |
         case "$RUNNER_OS" in
@@ -81,13 +78,20 @@ jobs:
         export PINNED_URL="https://github.com/duckdb/duckdb/releases/download/v$(cat bench/DUCKDB_VERSION)/${asset}"
         # Python, not find/unzip: RUNNER_TEMP is a Windows path under Git Bash,
         # the alpha may ship as .zip or .tar.gz, and may nest the binary.
+        # A bare Python-urllib User-Agent gets 403 from some CDNs; on any HTTP
+        # error, print status + body so a UA block and a missing file differ.
         python - <<'PY'
-        import os, pathlib, shutil, stat, subprocess, urllib.request
+        import os, pathlib, shutil, stat, subprocess, sys, urllib.error, urllib.request
         tmp, exe = pathlib.Path(os.environ["RUNNER_TEMP"]), "duckdb" + os.environ["EXE"]
         with open(os.environ["GITHUB_ENV"], "a") as env:
             for name, url in (("PINNED", os.environ["PINNED_URL"]), ("CANDIDATE", os.environ["CANDIDATE_URL"])):
                 archive = tmp / url.rstrip("/").rsplit("/", 1)[-1]
-                urllib.request.urlretrieve(url, archive)
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (csvql-bench)"})
+                try:
+                    with urllib.request.urlopen(req) as r, open(archive, "wb") as f:
+                        shutil.copyfileobj(r, f)
+                except urllib.error.HTTPError as e:
+                    sys.exit(f"{name}: HTTP {e.code} for {url}\nserver: {e.headers.get('Server')}\n{e.read()[:500]!r}")
                 dest = tmp / f"duck-{name.lower()}"
                 shutil.unpack_archive(archive, dest)
                 bins = [p for p in dest.rglob(exe) if p.is_file()]
@@ -98,6 +102,9 @@ jobs:
                 print(name, b, subprocess.run([b, "--version"], capture_output=True, text=True).stdout.strip())
                 env.write(f"DUCK_{name}={b}\n")
         PY
+
+    - name: Build csvql (ReleaseFast)
+      run: zig build -Doptimize=ReleaseFast
 
     - name: Fetch taxi data
       run: python bench/bench_taxi_versions.py fetch --out "$RUNNER_TEMP/taxi" $([ "$SCALE" = full ] && echo --full)
