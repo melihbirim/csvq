@@ -102,7 +102,7 @@ The sample flatters csvql, because on small files DuckDB's startup cost is a lar
 
 The spread between VMs was 0–1%: the Linux runners are much steadier than the Windows ones.
 
-**Windows** (`windows-latest`): *[results pending — the run is in progress]*
+**Windows** (`windows-latest`): the 8 GB run was still in progress when this post went up. The table will be added here once it finishes.
 
 ---
 
