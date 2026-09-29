@@ -14,25 +14,7 @@ const arena_buffer = @import("arena_buffer.zig");
 const memfile = @import("memfile.zig");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
-
-/// Map a file into memory (POSIX) or read it into an allocated buffer (Windows).
-/// Caller must pass the same allocator to unmapFile.
-fn mapFile(allocator: Allocator, file: std.fs.File, size: u64) ![]const u8 {
-    if (builtin.os.tag == .windows) {
-        return file.readToEndAlloc(allocator, @intCast(size));
-    }
-    const mapped = try std.posix.mmap(null, @intCast(size), std.posix.PROT.READ, .{ .TYPE = .SHARED }, file.handle, 0);
-    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
-    return mapped;
-}
-
-fn unmapFile(allocator: Allocator, data: []const u8) void {
-    if (builtin.os.tag == .windows) {
-        allocator.free(data);
-    } else {
-        std.posix.munmap(@alignCast(data));
-    }
-}
+const file_map = @import("file_map.zig");
 
 /// macOS libc sysctl accessor — resolved at link time via linkLibC().
 extern fn sysctlbyname(
@@ -1275,8 +1257,8 @@ fn executeParallelScalar(
     const file_size = (try input_file.stat()).size;
     if (file_size == 0) return error.EmptyFile;
 
-    const data = try mapFile(allocator, input_file, file_size);
-    defer unmapFile(allocator, data);
+    const data = try file_map.map(input_file, file_size);
+    defer file_map.unmap(data);
 
     // Parse header
     const hinfo = try csv.resolveMmapHeader(allocator, data, opts);
@@ -1779,8 +1761,8 @@ fn executeJoinThenAggregate(
             const f = try std.fs.cwd().openFile(fp, .{});
             defer f.close();
             const stat = try f.stat();
-            const data = try mapFile(aa, f, stat.size);
-            defer unmapFile(aa, data);
+            const data = try file_map.map(f, stat.size);
+            defer file_map.unmap(data);
             const hinfo = try csv.resolveMmapHeader(aa, data, opts);
             for (hinfo.names) |name| {
                 const lower = try aa.alloc(u8, name.len);
@@ -2130,8 +2112,8 @@ fn executeJoin(
         const base_size = (base_file.stat() catch break :parallel).size;
         if (base_size < 8 * 1024 * 1024) break :parallel; // small base: sequential is fine
 
-        const base_data = mapFile(allocator, base_file, base_size) catch break :parallel;
-        defer unmapFile(allocator, base_data);
+        const base_data = file_map.map(base_file, base_size) catch break :parallel;
+        defer file_map.unmap(base_data);
         const header_nl = std.mem.indexOfScalar(u8, base_data, '\n') orelse break :parallel;
         const chunks = try splitLineChunks(base_data, header_nl + 1, nthreads, aa, opts.delimiter);
 
@@ -3549,8 +3531,8 @@ fn executeDistinct(
     const file_size = (try file.stat()).size;
     if (file_size == 0) return error.EmptyFile;
 
-    const data = try mapFile(allocator, file, file_size);
-    defer unmapFile(allocator, data);
+    const data = try file_map.map(file, file_size);
+    defer file_map.unmap(data);
 
     var writer = csv.RecordWriter.init(output_file, opts);
     defer writer.deinit();
@@ -3837,8 +3819,8 @@ fn executeScalarAgg(
     const file_size = (try file.stat()).size;
     if (file_size == 0) return error.EmptyFile;
 
-    const data = try mapFile(allocator, file, file_size);
-    defer unmapFile(allocator, data);
+    const data = try file_map.map(file, file_size);
+    defer file_map.unmap(data);
 
     var writer = csv.RecordWriter.init(output_file, opts);
     defer writer.deinit();
@@ -5486,8 +5468,8 @@ fn executeGroupBy(
 
     // Memory-map the file: zero-copy sequential scan, better prefetch than
     // buffered I/O for the full-table reads that GROUP BY requires.
-    const data = try mapFile(allocator, file, file_size);
-    defer unmapFile(allocator, data);
+    const data = try file_map.map(file, file_size);
+    defer file_map.unmap(data);
 
     var writer = csv.RecordWriter.init(output_file, opts);
     defer writer.deinit();
