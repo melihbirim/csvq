@@ -337,3 +337,98 @@ def ask(csv_path, question, api_key=None, run=True):
 
     sql = to_sql(csv_path, p, literals)
     return sql, (csvql.query(sql) if run else None), tokens
+
+
+# ── JOIN ─────────────────────────────────────────────────────────────────────
+
+def join_candidates(left_path, right_path, probe=200):
+    """Column pairs that plausibly join the two files, ranked by measured overlap.
+
+    Code proposes, csvql verifies, the model only picks. For each pair of
+    columns it samples distinct values from both sides and measures how much
+    they actually intersect, so a pair survives because the data says it joins,
+    not because the names look alike. `order_id` against a `status` column of
+    the same width scores zero and never reaches the model.
+    """
+    lcols, _ = peek(left_path, 1)
+    rcols, _ = peek(right_path, 1)
+
+    def sample_vals(path, col):
+        try:
+            rows = csvql.query(f"SELECT DISTINCT {col} FROM '{path}' LIMIT {probe}")
+            return {str(r[col]).strip() for r in rows if str(r[col]).strip()}
+        except Exception:
+            return set()
+
+    lvals = {c: sample_vals(left_path, c) for c in lcols}
+    rvals = {c: sample_vals(right_path, c) for c in rcols}
+
+    scored = []
+    for lc in lcols:
+        for rc in rcols:
+            a, b = lvals[lc], rvals[rc]
+            if not a or not b:
+                continue
+            overlap = len(a & b) / min(len(a), len(b))
+            if overlap > 0.1:
+                scored.append((overlap, lc, rc))
+    scored.sort(reverse=True)
+    return scored[:12]
+
+
+def plan_join(question, left_path, right_path, api_key=None):
+    """Pick the join key and the direction. One request.
+
+    The candidate pairs come from measured value overlap, so the model is
+    choosing among joins that demonstrably work rather than inventing one.
+    """
+    api_key = api_key or os.environ.get("TYPESAFE_API_KEY")
+    cands = join_candidates(left_path, right_path)
+    if not cands:
+        raise JevError(
+            f"no column pair in {os.path.basename(left_path)} and "
+            f"{os.path.basename(right_path)} shares enough values to join on"
+        )
+
+    lcols, lrows = peek(left_path)
+    rcols, rrows = peek(right_path)
+    criteria = {
+        f"{lc}={rc}": f"{lc} on the left matches {rc} on the right "
+                      f"({overlap:.0%} of sampled values in common)"
+        for overlap, lc, rc in cands
+    }
+    resp = _call(
+        {"question": question,
+         "left_file": {"name": os.path.basename(left_path), "columns": lcols,
+                       "sample_rows": lrows},
+         "right_file": {"name": os.path.basename(right_path), "columns": rcols,
+                        "sample_rows": rrows}},
+        {"key": {"type": "choice",
+                 "instructions": ("Which pair of columns joins these two files for "
+                                  "`question`? Each option shows how much the two "
+                                  "columns' values actually overlap."),
+                 "criteria": criteria}},
+        api_key,
+    )
+    pair = resp["answers"]["key"]["choice"]
+    lk, rk = pair.split("=", 1)
+    return {
+        "left_key": lk, "right_key": rk,
+        "confidence": resp["answers"]["key"].get("confidence"),
+        "overlap": next(o for o, a, b in cands if a == lk and b == rk),
+        "input_tokens": resp.get("usage", {}).get("input_tokens", 0),
+    }
+
+
+def ask_join(left_path, right_path, question, api_key=None, run=True):
+    """Join two CSVs and answer a question over the result.
+
+    Returns (sql, rows, input_tokens). The projection is left as `*`: picking
+    columns across two files needs qualified names and is a wider grammar than
+    this example carries.
+    """
+    j = plan_join(question, left_path, right_path, api_key)
+    tokens = j["input_tokens"]
+    sql = (f"SELECT * FROM '{left_path}' a "
+           f"JOIN '{right_path}' b ON a.{j['left_key']} = b.{j['right_key']}")
+    return sql, (csvql.query(sql) if run else None), tokens, j
