@@ -43,57 +43,42 @@ pub fn findRecordEnd(data: []const u8, start: usize, delimiter: u8) ?usize {
 }
 
 fn findRecordEndScalar(data: []const u8, start: usize, delimiter: u8) ?usize {
-    // Same state machine as before, but it jumps between interesting bytes with
-    // SIMD scans instead of stepping one byte at a time.
+    // Same state machine as the byte loop this replaces, but it jumps between
+    // interesting bytes with SIMD scans instead of stepping.
     //
-    // This path used to be a byte loop, on the assumption that quoted rows are
-    // rare. Files written by Excel, Postgres and pandas quote by default, and on
-    // those the fast path above misses on every row and the whole file is parsed
-    // a byte at a time. Measured on 4M rows where quoting was the only variable:
-    // 10.0 GB/s unquoted against 2.6 GB/s quoted, and `sample` put 77% of scan
-    // time in this function.
-    //
-    // The flag that seems to force a byte loop is `at_field_start`, but outside a
-    // quote it is derivable: a delimiter sets it, a newline returns, and anything
-    // else clears it, so it is true only at `start` or immediately after a
-    // delimiter. That makes it an O(1) test at any position and lets the scan
-    // skip everything that is not a quote or a newline.
+    // Two things make that possible. First, `at_field_start` looks like state
+    // that has to be carried, but outside a quote it is derivable: a delimiter
+    // sets it, a newline returns, anything else clears it, so it is true only at
+    // `start` or immediately after a delimiter. Second, every quote search is
+    // bounded by the next newline. Without that bound, closing a quoted field
+    // sends the next search into the following record to find a quote that is
+    // then discarded because the newline was one byte away, and the scan ends up
+    // re-reading most of the file.
     var i = start;
-    while (i < data.len) {
-        // Outside a quote: the next byte that can change anything is '"' or '\n'.
-        const next_quote = std.mem.indexOfScalarPos(u8, data, i, '"');
-        const next_nl = std.mem.indexOfScalarPos(u8, data, i, '\n');
+    outer: while (true) {
+        const nl = std.mem.indexOfScalarPos(u8, data, i, '\n') orelse return null;
 
-        if (next_nl) |nl| {
-            if (next_quote == null or nl < next_quote.?) return nl;
-        } else if (next_quote == null) {
-            return null;
-        }
-
-        const q = next_quote.?;
-        // A quote only opens a field when it sits at the start of one; anywhere
-        // else it is an ordinary byte, exactly as the old loop treated it.
-        const at_field_start = q == start or data[q - 1] == delimiter;
-        if (!at_field_start) {
-            i = q + 1;
-            continue;
-        }
-
-        // Inside the quoted field: skip to the closing quote, treating "" as an
-        // escaped quote and staying inside.
-        i = q + 1;
-        while (std.mem.indexOfScalarPos(u8, data, i, '"')) |close| {
-            if (close + 1 < data.len and data[close + 1] == '"') {
-                i = close + 2;
-                continue;
+        // Look for a quote that actually opens a field, but only before `nl`.
+        var j = i;
+        while (std.mem.indexOfScalarPos(u8, data[0..nl], j, '"')) |q| {
+            if (q == start or data[q - 1] == delimiter) {
+                // Opens a quoted field: skip to its close, which may be past nl,
+                // then start over from there. "" stays inside the field.
+                var k = q + 1;
+                while (std.mem.indexOfScalarPos(u8, data, k, '"')) |close| {
+                    if (close + 1 < data.len and data[close + 1] == '"') {
+                        k = close + 2;
+                        continue;
+                    }
+                    i = close + 1;
+                    continue :outer;
+                }
+                return null; // unterminated quote
             }
-            i = close + 1;
-            break;
-        } else {
-            return null; // unterminated quote: no record end in this buffer
+            j = q + 1; // a quote mid-field is an ordinary byte
         }
+        return nl; // nothing before nl opened a field
     }
-    return null;
 }
 
 test "findRecordEnd: quoted fields, escapes, and quotes that do not open a field" {
