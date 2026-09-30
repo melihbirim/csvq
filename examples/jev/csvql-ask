@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Ask a CSV a question in English; csvql runs the SQL.
+
+    csvql-ask sales.csv "total revenue by region, highest first"
+    csvql-ask tickets.csv "how many enterprise tickets"
+    csvql-ask people.csv "everyone over 40 in Berlin"
+
+    --explain   print the SQL and stop, run nothing
+    --limit N   append LIMIT N
+
+One request to the model per question, carrying the header and five sample
+rows. No row of your data is ever sent: the model chooses slots in a SQL
+grammar this tool owns, and csvql does the reading.
+
+Needs csvql on PATH (or CSVQL=...) and TYPESAFE_API_KEY. No dependencies.
+"""
+
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from plan import (  # noqa: E402
+    JevError, build_sql, csvql, distinct_values, plan, resolve_literal, sample,
+)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("csv_path")
+    ap.add_argument("question")
+    ap.add_argument("--explain", action="store_true", help="print the SQL, run nothing")
+    ap.add_argument("--limit", type=int, default=0)
+    args = ap.parse_args()
+
+    csvql_bin = os.environ.get("CSVQL", "csvql")
+    api_key = os.environ.get("TYPESAFE_API_KEY")
+    if not api_key:
+        sys.exit("TYPESAFE_API_KEY is not set")
+
+    try:
+        columns, rows = sample(csvql_bin, args.csv_path)
+    except Exception as e:
+        sys.exit(f"could not read {args.csv_path}: {e}")
+
+    try:
+        p = plan(args.question, columns, rows, api_key)
+    except JevError as e:
+        sys.exit(f"planning failed: {e}")
+
+    tokens = p["usage"].get("input_tokens", 0)
+
+    # A string comparison needs a literal. Rather than let the model write one,
+    # ask csvql for the column's real values and have the model pick.
+    literal = None
+    f = p["filter"]
+    if f and f["column"] and not f["numbers"]:
+        cands = distinct_values(csvql_bin, args.csv_path, f["column"])
+        if cands:
+            picked = resolve_literal(args.question, f["column"], cands, api_key)
+            if picked:
+                literal, lit_conf = picked
+                print(f"literal  {f['column']} -> {literal!r} "
+                      f"(chosen from {len(cands)} real values, confidence {lit_conf:.2f})")
+        if literal is None:
+            print(f"note     could not resolve a value for {f['column']}; dropping that filter")
+            p["filter"] = None
+
+    sql = build_sql(args.csv_path, p, literal, args.limit or None)
+    print(f"sql      {sql}")
+    print(f"cost     {tokens:,} input tokens, ${tokens / 1e6 * 0.042:.6f} at list price, "
+          f"0 rows of data sent")
+
+    if p["needs_judgment"] >= 0.5:
+        print(f"note     this question also asks for a judgment about free text "
+              f"({p['needs_judgment']:.2f}); SQL alone will not answer that part")
+
+    if args.explain:
+        return
+
+    try:
+        print()
+        print(csvql(csvql_bin, sql), end="")
+    except Exception as e:
+        sys.exit(f"csvql failed: {e}\n  query was: {sql}")
+
+
+if __name__ == "__main__":
+    main()
