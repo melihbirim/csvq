@@ -22,7 +22,39 @@ rather than generated text.
                                                         leaves the machine
 ```
 
-## Running it
+## Ask in English: `csvql-ask`
+
+```console
+$ csvql-ask people.csv "give me the people who are angry over 40"
+plan  sql:      SELECT * FROM 'people.csv' WHERE age > 40
+      judge:    'review' against the subjective part (text column confidence 1.00)
+
+stage 1  csvql -> 25 rows
+stage 2  Jev judged 25 rows, 10,164 input tokens, $0.00043 at list price
+
+9 match at p >= 0.7:
+  p=0.95  name=Ada20, age=54, city=Berlin
+          Your support team closed my ticket without fixing anything. Unbelievable.
+  ...
+```
+
+No SQL. `over 40` became a `WHERE` clause; `angry` became a judgment; the split
+was decided by the model and printed before anything ran. `--explain` stops
+after the plan.
+
+**Jev never writes the SQL.** It returns typed judgments, not text, so the plan
+is assembled by selection: code supplies the candidates — the real column names,
+the numeric literals found in the question, the five operators csvql implements —
+and Jev picks which ones the question meant. The model cannot name a column that
+does not exist or an operator the engine cannot run, because neither is on the
+menu. That is the [select, don't generate](https://docs.typesafe.ai/cookbooks/pre_parsed_value_extraction_cookbook.md)
+pattern, and it is why this needs no SQL validation layer.
+
+The whole plan is one request: the schema goes out once and the questions run in
+parallel, including the speculative ones about a numeric filter that a question
+without numbers simply never consumes.
+
+## Running the two-stage script directly
 
 ```sh
 export TYPESAFE_API_KEY=...
@@ -123,10 +155,14 @@ egress boundary to be something you wrote rather than something a planner chose.
 - **Only stage 1 is measured here.** The 2.96 GB scan and row counts are real,
   from the fixture in this directory. The cost table is arithmetic from Jev's
   published list price and measured token counts per row, not a bill anyone paid.
-- **Accuracy is unverified.** No labelled set, so nothing here says how often the
-  `angry` judgment is right. Before relying on it, label a few hundred tickets
-  from your own data and pick the threshold from that. Typed output guarantees
-  the shape of the answer, not its truth.
+- **Accuracy was measured, on an easy task.** Both fixtures are generated, so
+  every row carries a ground-truth label. On a balanced 40-ticket sample Jev
+  scored 100% at every threshold from 0.5 to 0.9, with the probabilities well
+  separated: angry rows 0.92-0.98, calm rows 0.04-0.08. `csvql-ask` returned
+  exactly the 9 angry people over 40, with no false positives or negatives.
+  Read that as evidence the plumbing is right, not that the model is infallible:
+  eight fixed bodies with unambiguous tone is a much easier problem than real
+  support mail. Label your own data before picking a threshold.
 - **The fixture is synthetic**, with four angry and four calm bodies. It is built
   so that keyword matching cannot substitute for judgment, which makes it a fair
   demonstration of the pattern and a poor benchmark of the model.
