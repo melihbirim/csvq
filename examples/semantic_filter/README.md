@@ -72,13 +72,14 @@ Generate the fixture with `gen_tickets.py` (deterministic; 20M rows ≈ 2.96 GB)
 ## Why the order matters
 
 Judging every row is the obvious approach and the wrong one. Each request here
-carries about 429 input tokens — the ticket plus the instructions and criteria,
-which are resent every time. At Jev's published $0.042 per million input tokens:
+carries **589 input tokens**, measured from the API's own `usage` field — the
+ticket plus the instructions and criteria, which are resent every time. At Jev's
+published $0.042 per million input tokens, with output tokens free:
 
 | | rows judged | input tokens | cost at list price |
 |---|---|---|---|
-| judge everything | 20,000,000 | ~8.6 billion | **~$360** |
-| filter first, then judge | 2,785 | ~1.2 million | **~$0.05** |
+| judge everything | 20,000,000 | 11.8 billion | **~$495** |
+| filter first, then judge | 2,785 | 1.6 million | **~$0.07** |
 
 Same answer, roughly 7,000x less money, because the SQL predicates are exact and
 free and they remove 99.986% of the rows before anything is paid for. The scan
