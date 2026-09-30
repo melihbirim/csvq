@@ -34,7 +34,7 @@ yellow,967553
   0.05s — no import, queried straight off the file
 ```
 
-[Website](https://melihbirim.github.io/csvql/) · [Quick Start](#quick-start) · [Installation](#installation) · [Performance](#performance) · [SQL Reference](#sql-reference) · [Docs](#documentation)
+[Website](https://csvql.birim.one.dev/) · [Quick Start](#quick-start) · [Installation](#installation) · [Performance](#performance) · [SQL Reference](#sql-reference) · [Docs](#documentation)
 
 ---
 

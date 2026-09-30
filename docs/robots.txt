@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://melihbirim.github.io/csvql/sitemap.xml
+Sitemap: https://csvql.birim.one.dev/sitemap.xml

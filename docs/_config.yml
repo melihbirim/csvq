@@ -1,6 +1,6 @@
 markdown: kramdown
-url: "https://melihbirim.github.io"
-baseurl: "/csvql"
+url: "https://csvql.birim.one.dev"
+baseurl: ""
 title: "csvql"
 description: "The analytical CSV query engine for AI agents. Run SQL on CSV files in place using about 10x less memory than a database. MCP-native, sandboxed with --root, a single 1.3 MB binary."
 logo: "/logo.svg"
