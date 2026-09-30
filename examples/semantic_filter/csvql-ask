@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Ask a CSV a question in English.
+
+    csvql-ask people.csv "give me the people who are angry over 40"
+
+The question is split into the part SQL can answer exactly and the part that
+needs judgment:
+
+    over 40   ->  WHERE age > 40          csvql, locally, over the whole file
+    angry     ->  a judgment per row      Jev, on the survivors only
+
+Jev returns typed judgments, not text, so it never writes the SQL. Code finds
+the candidates — the column names, the numeric literals in the question, the
+handful of operators SQL has — and Jev picks which ones the question meant.
+That keeps the plan inside a space the code already validated: the model cannot
+invent a column that does not exist or an operator csvql cannot run.
+
+    export TYPESAFE_API_KEY=...
+    csvql-ask people.csv "angry customers over 40"
+    csvql-ask people.csv "..." --explain      # show the plan, run nothing
+    csvql-ask people.csv "..." --threshold .8
+
+Requires csvql on PATH (or CSVQL=...). No Python dependencies.
+"""
+
+import argparse
+import csv
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+API_URL = "https://api.typesafe.ai/v1/systemone"
+MODEL = "jev-latest"
+
+# The operators csvql supports, described so the model picks by meaning.
+OPS = {
+    "greater_than": "more than, over, above, older than, at least (exclusive)",
+    "less_than": "fewer than, under, below, younger than, at most (exclusive)",
+    "greater_or_equal": "at least, minimum, no less than (inclusive)",
+    "less_or_equal": "at most, maximum, no more than (inclusive)",
+    "equal": "exactly this value",
+}
+OP_SQL = {
+    "greater_than": ">", "less_than": "<", "greater_or_equal": ">=",
+    "less_or_equal": "<=", "equal": "=",
+}
+
+
+def ask_jev(state, questions, api_key):
+    req = urllib.request.Request(
+        API_URL,
+        data=json.dumps({"state": state, "model": MODEL, "questions": questions}).encode(),
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        sys.exit(f"Jev API error {e.code}: {e.read()[:300].decode(errors='replace')}")
+
+
+def sniff(csv_path, csvql_bin, n=3):
+    """Header plus a few real rows. The model needs to see values, not just names:
+    'angry' belongs to a column of sentences, not a column of integers."""
+    out = subprocess.run(
+        [csvql_bin, f"SELECT * FROM '{csv_path}' LIMIT {n}"],
+        capture_output=True, text=True, check=False,
+    )
+    if out.returncode != 0:
+        sys.exit(f"csvql failed reading {csv_path}: {out.stderr.strip()}")
+    rows = list(csv.DictReader(io.StringIO(out.stdout)))
+    if not rows:
+        sys.exit(f"{csv_path} has no rows")
+    return list(rows[0].keys()), rows
+
+
+def plan(question, columns, samples, api_key):
+    """One request. Every question is independent, so they run in parallel and the
+    schema is sent once. Speculative by design: if the question has no numeric
+    part, the numeric answers are simply not consumed."""
+    numbers = re.findall(r"\d+(?:\.\d+)?", question)
+
+    col_criteria = {c: f"values look like: {samples[0].get(c, '')!r}" for c in columns}
+
+    questions = {
+        "text_column": {
+            "type": "choice",
+            "instructions": (
+                "Which column holds the free text that the subjective part of "
+                "`question` is about? Pick the column of sentences written by a person."
+            ),
+            "criteria": col_criteria,
+        },
+        "has_numeric_filter": {
+            "type": "noul",
+            "instructions": "Does `question` constrain a numeric column to a range or threshold?",
+            "criteria": {
+                "true": "Contains a comparison such as over 40, under 100, at least 3.",
+                "false": "No numeric comparison.",
+            },
+        },
+        "has_semantic_filter": {
+            "type": "noul",
+            "instructions": (
+                "Does `question` ask for something that requires reading and judging "
+                "the free text, rather than an exact match a database could do?"
+            ),
+            "criteria": {
+                "true": "Asks about tone, sentiment, intent or meaning, such as angry, "
+                        "confused, at risk of leaving.",
+                "false": "Every condition is an exact comparison or equality.",
+            },
+        },
+    }
+    if numbers:
+        questions["numeric_column"] = {
+            "type": "choice",
+            "instructions": (
+                f"The number {numbers[0]} appears in `question`. Which column does it "
+                "constrain?"
+            ),
+            "criteria": col_criteria,
+        }
+        questions["numeric_operator"] = {
+            "type": "choice",
+            "instructions": f"How does `question` compare that column to {numbers[0]}?",
+            "criteria": OPS,
+        }
+
+    answers = ask_jev(
+        {"question": question, "columns": columns, "sample_rows": samples},
+        questions, api_key,
+    )["answers"]
+
+    p = {
+        "text_column": answers["text_column"]["choice"],
+        "text_confidence": answers["text_column"].get("confidence"),
+        "semantic": answers["has_semantic_filter"]["noul"],
+        "numeric": None,
+    }
+    if numbers and answers["has_numeric_filter"]["noul"] >= 0.5:
+        p["numeric"] = {
+            "column": answers["numeric_column"]["choice"],
+            "op": answers["numeric_operator"]["choice"],
+            "value": numbers[0],
+            "confidence": answers["numeric_operator"].get("confidence"),
+        }
+    return p
+
+
+def judge_row(row, question, text_col, api_key):
+    body = ask_jev(
+        {"record": row, "question": question},
+        {
+            "matches": {
+                "type": "noul",
+                "instructions": (
+                    f"Judging only the subjective part of `question`, does "
+                    f"`record.{text_col}` satisfy it? Ignore any numeric or exact "
+                    f"conditions in the question; those are already applied."
+                ),
+                "criteria": {
+                    "true": "The text clearly satisfies the subjective condition.",
+                    "false": "It does not, or there is no evidence either way.",
+                },
+            }
+        },
+        api_key,
+    )
+    return body["answers"]["matches"]["noul"], body.get("usage", {}).get("input_tokens", 0)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("csv_path")
+    ap.add_argument("question")
+    ap.add_argument("--explain", action="store_true", help="print the plan, run nothing")
+    ap.add_argument("--threshold", type=float, default=0.7)
+    ap.add_argument("--limit", type=int, default=200, help="max rows sent for judging")
+    ap.add_argument("--concurrency", type=int, default=8)
+    args = ap.parse_args()
+
+    csvql_bin = os.environ.get("CSVQL", "csvql")
+    api_key = os.environ.get("TYPESAFE_API_KEY")
+    if not api_key:
+        sys.exit("TYPESAFE_API_KEY is not set")
+
+    columns, samples = sniff(args.csv_path, csvql_bin)
+    p = plan(args.question, columns, samples, api_key)
+
+    where = ""
+    if p["numeric"]:
+        n = p["numeric"]
+        where = f" WHERE {n['column']} {OP_SQL[n['op']]} {n['value']}"
+    sql = f"SELECT * FROM '{args.csv_path}'{where}"
+
+    print(f"plan  sql:      {sql}")
+    print(f"      judge:    {p['text_column']!r} against the subjective part "
+          f"(text column confidence {p['text_confidence']:.2f})")
+    if p["semantic"] < 0.5:
+        print(f"      note:     no subjective part detected ({p['semantic']:.2f}); "
+              f"SQL alone answers this")
+    if args.explain:
+        return
+
+    rows = list(csv.DictReader(io.StringIO(
+        subprocess.run([csvql_bin, sql], capture_output=True, text=True, check=True).stdout
+    )))
+    print(f"\nstage 1  csvql -> {len(rows):,} rows")
+
+    if p["semantic"] < 0.5:
+        for r in rows[:20]:
+            print("  " + ", ".join(f"{k}={v}" for k, v in r.items()))
+        return
+
+    if len(rows) > args.limit:
+        print(f"         capping at {args.limit} for judging (--limit to change)")
+        rows = rows[: args.limit]
+
+    with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+        judged = list(pool.map(
+            lambda r: judge_row(r, args.question, p["text_column"], api_key), rows))
+
+    tokens = sum(t for _, t in judged)
+    hits = [(r, s) for r, (s, _) in zip(rows, judged) if s >= args.threshold]
+    hits.sort(key=lambda rs: -rs[1])
+
+    print(f"stage 2  Jev judged {len(rows)} rows, {tokens:,} input tokens, "
+          f"${tokens / 1e6 * 0.042:.5f} at list price")
+    print(f"\n{len(hits)} match at p >= {args.threshold}:\n")
+    for r, score in hits[:20]:
+        rest = {k: v for k, v in r.items() if k != p["text_column"]}
+        print(f"  p={score:.2f}  " + ", ".join(f"{k}={v}" for k, v in list(rest.items())[:4]))
+        print(f"          {r[p['text_column']][:92]}")
+
+
+if __name__ == "__main__":
+    main()
