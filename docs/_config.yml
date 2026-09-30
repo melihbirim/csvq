@@ -4,6 +4,12 @@ baseurl: "/csvql"
 title: "csvql"
 description: "The analytical CSV query engine for AI agents. Run SQL on CSV files in place using about 10x less memory than a database. MCP-native, sandboxed with --root, a single 1.3 MB binary."
 logo: "/logo.svg"
+
+# Proves site ownership to Google Search Console. jekyll-seo-tag turns this into
+# a <meta name="google-site-verification"> on every page, so it keeps working if
+# the homepage layout changes. The token is public by design: it proves control
+# of the site, it grants nothing.
+google_site_verification: "1Z8gmNAxHje2QVP72lrmBywql86AyUe6ZNpmFMsG0zo"
 social:
   name: csvql
   links:
