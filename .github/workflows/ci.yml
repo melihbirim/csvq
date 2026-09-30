@@ -1,10 +1,30 @@
 name: CI
 
+# Documentation-only changes skip the build matrix. A one-line edit to the
+# website or a README does not need Zig built and tested on three operating
+# systems plus the Node and Python bindings, and waiting on thirteen jobs to
+# approve a typo fix is how people stop fixing typos.
+#
+# paths-ignore skips a run only when EVERY changed file matches, so a PR that
+# touches src/ and README.md together still runs in full.
+#
+# Nothing in this workflow reads a markdown file or anything under docs/, so
+# there is no build input being ignored here. If that ever changes, this list
+# has to shrink with it.
+#
+# Safe because main has no required status checks. With branch protection
+# turned on, a skipped required check leaves the PR waiting forever instead of
+# passing, and the fix is a separate always-succeeding job of the same name.
 on:
   push:
     branches: [ main, fix/code-review-issues ]
+    paths-ignore: &docs_only
+      - 'docs/**'
+      - '**.md'
+      - '.gitignore'
   pull_request:
     branches: [ main ]
+    paths-ignore: *docs_only
 
 jobs:
   test:
