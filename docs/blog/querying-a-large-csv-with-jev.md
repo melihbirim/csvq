@@ -1,7 +1,7 @@
 ---
 layout: post
-title: "Asking a 3 GB CSV a Question in English Costs the Same as Asking 10 Rows"
-description: "Sending rows to a model means the bill grows with the file. Sending the schema instead means it does not. One question, files from 10 to 20 million rows, the same 3,322 tokens every time."
+title: "Querying a 3 GB CSV with Jev Costs the Same as Querying 10 Rows"
+description: "Jev turns an English question into SQL for a CSV without ever seeing the data. One question, files from 10 to 20 million rows, the same 3,322 tokens every time."
 date: 2026-09-30
 ---
 
