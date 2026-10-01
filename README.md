@@ -138,7 +138,19 @@ sudo cp zig-out/bin/csvql /usr/local/bin/
 
 ## Performance
 
-**20M rows, 711 MB unquoted CSV, Apple M2 Pro** — aggregates on the raw CSV, both engines reading it directly (best-of-5):
+**Two fixture sizes, unquoted CSV, Apple M2 Pro**, both engines reading the raw file. Small files are timed as the mean of 30 runs because a single run finishes faster than a shell timer can resolve.
+
+**2M rows, 69 MB:**
+
+| Query | csvql | DuckDB | Speedup |
+| --- | --- | --- | --- |
+| `COUNT(*)` | **0.0139s** | 0.1185s | **8.5x** |
+| `COUNT(*) WHERE age > 30` | **0.0134s** | 0.1170s | **8.7x** |
+| `SUM(salary), AVG(salary)` | **0.0180s** | 0.1178s | **6.5x** |
+
+At this size process startup is a visible share of both totals: 0.022s for DuckDB, 0.005s for csvql. Subtracting it, `COUNT(*)` is 10.5x rather than 8.5x, so these figures understate rather than flatter.
+
+**20M rows, 711 MB** (best-of-5):
 
 | Query                                   | csvql      | DuckDB | Speedup   |
 | --------------------------------------- | ---------- | ------ | --------- |
@@ -150,14 +162,20 @@ sudo cp zig-out/bin/csvql /usr/local/bin/
 
 The last row is a real loss, not a rounding artefact: `MEDIAN` buffers every value in a group, so its memory and time are O(rows) rather than O(groups) ([#205](https://github.com/melihbirim/csvql/issues/205)).
 
-**Quoting changes the picture.** csvql skips 16 bytes at a time whenever no delimiter, newline or quote is present; a quoted field disables that and the lead narrows. Same files, differing only in whether one column is quoted, `COUNT(*)` with a `WHERE`, 12 threads:
+**Quoting changes the picture; column count does not.** csvql skips 16 bytes at a time whenever no delimiter, newline or quote is present, and a quoted field disables that. Same files, ~200-byte rows, differing only in whether one column is quoted, `COUNT(*)` with a `WHERE`, 12 threads:
 
-| | csvql | DuckDB | Speedup |
-| --- | --- | --- | --- |
-| unquoted | 11.9 to 15.0 GB/s | 1.3 to 2.2 GB/s | **6x to 9.5x** |
-| quoted | 3.0 to 4.6 GB/s | 1.2 to 2.1 GB/s | **2.2x to 2.6x** |
+| Columns | Quoting | csvql | DuckDB | Speedup |
+| --- | --- | --- | --- | --- |
+| 2 | unquoted | **0.026s** | 0.170s | **6.5x** |
+| 2 | quoted | 0.084s | 0.136s | 1.6x |
+| 8 | unquoted | **0.040s** | 0.240s | **6.0x** |
+| 8 | quoted | 0.116s | 0.236s | 2.0x |
+| 32 | unquoted | **0.080s** | 0.458s | **5.7x** |
+| 32 | quoted | 0.196s | 0.384s | 2.0x |
 
-Faster on every shape measured, and dramatically faster on machine-generated CSV, which mostly does not quote. Why, and the work in progress: [The Journey to 10x DuckDB](https://melihbirim.github.io/csvql/blog/journey-to-10x-duckdb-csv.html).
+The speedup is steady across a sixteen-fold range of column counts. Quoting is the variable that matters, costing roughly 3x.
+
+Faster on every shape measured here, and dramatically faster on machine-generated CSV, which mostly does not quote. Reproduce with [`bench/bench_scaling.sh`](bench/bench_scaling.sh). Why, and the work in progress: [The Journey to 10x DuckDB](https://melihbirim.github.io/csvql/blog/journey-to-10x-duckdb-csv.html).
 
 **NYC Taxi, 20M rows, 8 GB CSV** — raw CSV, no ingest, both engines: **~3.2x** faster, **~6x** less memory, and **0 bytes** of extra storage (DuckDB's fast path needs a 2.1 GB native store first).
 
