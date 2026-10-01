@@ -39,7 +39,75 @@ pub fn findRecordEnd(data: []const u8, start: usize, delimiter: u8) ?usize {
     if (std.mem.indexOfScalarPos(u8, data[0..nl], start, '"') == null) {
         return nl;
     }
+    if (findRecordEndPrefixXor(data, start, delimiter)) |e| return e;
     return findRecordEndScalar(data, start, delimiter);
+}
+
+/// bit i = XOR of bits 0..i. Six shift-xor pairs; the hardware has a single
+/// PMULL that does this, but the portable form is already cheap next to a
+/// per-byte loop.
+inline fn prefixXor(x: u64) u64 {
+    var r = x;
+    r ^= r << 1;
+    r ^= r << 2;
+    r ^= r << 4;
+    r ^= r << 8;
+    r ^= r << 16;
+    r ^= r << 32;
+    return r;
+}
+
+/// Find a record end across quoted fields without branching on each quote.
+///
+/// The scalar path below has to look at every byte because it carries quote
+/// state one byte at a time. That is why quoting used to cost csvql its whole
+/// advantage: the unquoted path skips 16 bytes whenever no delimiter, newline
+/// or quote is present, and a single quote switches that skipping off.
+///
+/// Prefix XOR over the quote mask recovers it. Each 64-byte block computes
+/// which bytes sit inside a quoted field as a bitmask, so newlines inside
+/// quotes are masked away arithmetically and the block is still processed in
+/// one step.
+///
+/// Returns null when the block is not well formed under csvql's rule that a
+/// quote only opens a field at a field start; the caller then uses the scalar
+/// parser, which is always correct, just slower.
+fn findRecordEndPrefixXor(data: []const u8, start: usize, delimiter: u8) ?usize {
+    const B = 64;
+    var i = start;
+    var carry: u64 = 0; // all ones while inside a quoted field
+    var prev_was_struct: u64 = 1; // `start` is treated as a field start
+
+    while (i + B <= data.len) : (i += B) {
+        const chunk: @Vector(B, u8) = data[i..][0..B].*;
+        const q: u64 = @bitCast(chunk == @as(@Vector(B, u8), @splat('"')));
+        const d: u64 = @bitCast(chunk == @as(@Vector(B, u8), @splat(delimiter)));
+        const n: u64 = @bitCast(chunk == @as(@Vector(B, u8), @splat('\n')));
+
+        if (q == 0) {
+            const real_nl = n & ~carry;
+            if (real_nl != 0) return i + @ctz(real_nl);
+            prev_was_struct = ((d | n) >> (B - 1)) & 1;
+            continue;
+        }
+
+        const in_quote = prefixXor(q) ^ carry;
+        const struct_mask = d | n;
+        const opens = in_quote & ~((in_quote << 1) | (carry & 1));
+        // A field may open after a delimiter or newline. The second quote of an
+        // "" escape also reads as an open here, so a preceding quote counts too.
+        // Anything else is a stray quote inside an unquoted field, where csvql
+        // keeps it as a literal and this would wrongly toggle.
+        const prev_ok = (struct_mask << 1) | prev_was_struct | (q << 1);
+        if (opens & ~prev_ok != 0) return null;
+
+        const real_nl = n & ~in_quote;
+        if (real_nl != 0) return i + @ctz(real_nl);
+
+        carry = @as(u64, 0) -% ((in_quote >> (B - 1)) & 1);
+        prev_was_struct = ((struct_mask & ~in_quote) >> (B - 1)) & 1;
+    }
+    return null; // ran out of whole blocks; the scalar path finishes the tail
 }
 
 fn findRecordEndScalar(data: []const u8, start: usize, delimiter: u8) ?usize {
@@ -73,6 +141,26 @@ fn findRecordEndScalar(data: []const u8, start: usize, delimiter: u8) ?usize {
         i += 1;
     }
     return null;
+}
+
+test "findRecordEndPrefixXor agrees with the scalar path or declines" {
+    const T = struct {
+        fn both(data: []const u8) !void {
+            const want = findRecordEndScalar(data, 0, ',');
+            if (findRecordEndPrefixXor(data, 0, ',')) |got| {
+                try std.testing.expectEqual(want, @as(?usize, got));
+            }
+        }
+    };
+    const pad = "z" ** 70; // force at least one full 64-byte block
+    try T.both("a,b,c\n" ++ pad);
+    try T.both("a,\"b,c\",d\n" ++ pad);
+    try T.both("a,\"b\nc\",d\n" ++ pad);
+    try T.both("a,\"b\"\"c\",d\n" ++ pad);
+    try T.both("a,b\"c,d\n" ++ pad); // stray quote: must decline, never answer wrongly
+    try T.both("\"a\",\"b\",\"c\"\n" ++ pad);
+    try T.both("a,\"\",b\n" ++ pad);
+    try T.both(pad ++ "\na,b\n");
 }
 
 /// UTF-8 byte order mark. Excel's "CSV UTF-8" export writes one at the very
