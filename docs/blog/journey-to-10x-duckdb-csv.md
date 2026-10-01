@@ -187,6 +187,58 @@ twice: once to find where it ends, once to find where its fields are. The fused
 scan already computes both. Making the caller use what it computed is the next
 step, and it is worth roughly another 2x if the earlier experiments are any guide.
 
+## The full comparison, with the queries
+
+The numbers above all used one query shape. A filter that matches every row is
+not a filter, and the earlier fixtures had `region = 'apac'` on every line, so
+the `WHERE` was doing no work at all. Rebuilt with real selectivity: 50% `apac`,
+49% `emea`, 1% `rare`.
+
+Two files, 1,428,571 rows each, a 256-byte `note` column, identical except that
+one quotes `note`:
+
+```
+id,region,note
+000000000,apac,xxxxxxxx...          sel_u.csv   371 MB
+000000000,apac,"xxxxxxxx..."        sel_q.csv   373 MB
+```
+
+One thread, best of three, DuckDB 1.5.5 with `SET threads=1`, both reading the
+raw CSV:
+
+| query | csvql | DuckDB | ratio |
+|---|---|---|---|
+| **unquoted** | | | |
+| `SELECT COUNT(*)` | 4.86 GB/s | 0.36 GB/s | **13.6x** |
+| `SELECT COUNT(*) WHERE region='apac'` (50%) | 3.89 GB/s | 0.35 GB/s | **11.1x** |
+| `SELECT COUNT(*) WHERE region='rare'` (1%) | 4.32 GB/s | 0.31 GB/s | **13.8x** |
+| `SELECT note WHERE region='rare'` (1%) | 1.05 GB/s | 0.34 GB/s | 3.1x |
+| **quoted** | | | |
+| `SELECT COUNT(*)` | 1.57 GB/s | 0.89 GB/s | 1.8x |
+| `SELECT COUNT(*) WHERE region='apac'` (50%) | 1.51 GB/s | 0.87 GB/s | 1.7x |
+| `SELECT COUNT(*) WHERE region='rare'` (1%) | 1.51 GB/s | 0.87 GB/s | 1.7x |
+| `SELECT note WHERE region='rare'` (1%) | 0.65 GB/s | 0.82 GB/s | **0.8x** |
+
+Three things worth reading off that table.
+
+**Selectivity barely matters to csvql.** One percent and fifty percent cost the
+same, 1.51 GB/s either way, because the work is dominated by reading the file
+rather than by what matches. A more selective filter does not make the scan
+shorter.
+
+**Projection is what costs.** Returning the 256-byte column instead of counting
+rows takes unquoted from 13.6x down to 3.1x. That is the price of materialising
+and copying field values, and it is paid in both engines, just unevenly.
+
+**There is one shape where csvql loses: projecting a quoted column.** 0.65
+against 0.82 GB/s. It is the only row in the table under 1.0x, and it is the
+combination of both costs, a quoted scan feeding a projection. The fused scan
+now avoids re-parsing those rows, which is where the 15 to 25% in the last
+change came from, but it is not yet enough to close this one.
+
+That row is the honest headline for quoted data, and it is why "10x" in the
+title of this post is a destination rather than a description.
+
 ## Caveats
 
 - Every number here is single thread unless stated, measured on an M2 Pro against DuckDB 1.5.5, best of two or three runs, with the fixtures in page cache. They measure parse speed, not disk.
