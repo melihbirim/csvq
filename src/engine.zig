@@ -5028,7 +5028,10 @@ fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
             const fused = simd.scanRecordFused(work, scan, ctx.delimiter, &comma_positions);
 
             if (fused.had_quote) {
-                const nl = csv.findRecordEnd(work, scan, ctx.delimiter) orelse {
+                // The fused scan is quote-aware since the prefix-XOR change, so
+                // its end is valid here and findRecordEnd would just re-walk the
+                // record to reach the same answer.
+                const nl = fused.end orelse {
                     try seam_buf.appendSlice(aa, work[scan..]);
                     break;
                 };
@@ -5242,7 +5245,10 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
             var where_prechecked = false;
 
             if (fused.had_quote) {
-                const nl = csv.findRecordEnd(work, scan, ctx.delimiter) orelse {
+                // The fused scan is quote-aware since the prefix-XOR change, so
+                // its end is valid here and findRecordEnd would just re-walk the
+                // record to reach the same answer.
+                const nl = fused.end orelse {
                     try seam_buf.appendSlice(aa, work[scan..]);
                     break;
                 };
