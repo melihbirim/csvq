@@ -1,0 +1,35 @@
+name: Setup Zig
+description: >
+  Install Zig, retrying once if the download fails.
+
+  goto-bus-stop/setup-zig already caches the toolchain, but the cache is keyed
+  per runner OS and architecture, so a first run on any of the four images we
+  build on still downloads from ziglang.org. That download timed out three
+  times in one day, each time failing the whole job at its first step with
+  "Error: Request timed out" before a single line had compiled. Every one of
+  those cost a manual rerun that then passed unchanged.
+
+  A second attempt costs nothing when the first succeeds and turns a transient
+  network blip into a few wasted seconds instead of a red build.
+
+inputs:
+  version:
+    description: Zig version to install
+    required: false
+    default: "0.15.2"
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Zig
+      id: first
+      uses: goto-bus-stop/setup-zig@v2
+      continue-on-error: true
+      with:
+        version: ${{ inputs.version }}
+
+    - name: Setup Zig (retry after a failed download)
+      if: steps.first.outcome == 'failure'
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: ${{ inputs.version }}
