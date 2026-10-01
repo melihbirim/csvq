@@ -138,7 +138,19 @@ sudo cp zig-out/bin/csvql /usr/local/bin/
 
 ## Performance
 
-**20M rows, 711 MB unquoted CSV, Apple M2 Pro** — aggregates on the raw CSV, both engines reading it directly (best-of-5):
+**Two fixture sizes, unquoted CSV, Apple M2 Pro**, both engines reading the raw file. Small files are timed as the mean of 30 runs because a single run finishes faster than a shell timer can resolve.
+
+**2M rows, 69 MB:**
+
+| Query | csvql | DuckDB | Speedup |
+| --- | --- | --- | --- |
+| `COUNT(*)` | **0.0139s** | 0.1185s | **8.5x** |
+| `COUNT(*) WHERE age > 30` | **0.0134s** | 0.1170s | **8.7x** |
+| `SUM(salary), AVG(salary)` | **0.0180s** | 0.1178s | **6.5x** |
+
+At this size process startup is a visible share of both totals: 0.022s for DuckDB, 0.005s for csvql. Subtracting it, `COUNT(*)` is 10.5x rather than 8.5x, so these figures understate rather than flatter.
+
+**20M rows, 711 MB** (best-of-5):
 
 | Query                                   | csvql      | DuckDB | Speedup   |
 | --------------------------------------- | ---------- | ------ | --------- |
