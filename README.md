@@ -138,15 +138,28 @@ sudo cp zig-out/bin/csvql /usr/local/bin/
 
 ## Performance
 
-**2M rows, 56 MB CSV, Apple M2 Pro** — aggregates on the raw CSV (best-of-5):
+**20M rows, 711 MB unquoted CSV, Apple M2 Pro** — aggregates on the raw CSV, both engines reading it directly (best-of-5):
 
-| Query                        | csvql      | DuckDB | Speedup   |
-| ----------------------------- | ---------- | ------ | --------- |
-| `SELECT COUNT(*)` scalar      | **0.012s** | 0.136s | **11.3x** |
-| `COUNT(*) GROUP BY`           | **0.020s** | 0.146s | **7.3x**  |
-| `JOIN SELECT *` (2M × 6)      | **0.088s** | 7.832s | **89x**   |
+| Query                                   | csvql      | DuckDB | Speedup   |
+| --------------------------------------- | ---------- | ------ | --------- |
+| `COUNT(*) GROUP BY department`          | **0.098s** | 0.484s | **4.9x**  |
+| `COUNT(*) WHERE age > 30 GROUP BY`      | **0.102s** | 0.506s | **5.0x**  |
+| `SELECT DISTINCT city`                  | **0.090s** | 0.494s | **5.5x**  |
+| `SUM(salary), AVG(salary) GROUP BY`     | **0.132s** | 0.540s | **4.1x**  |
+| `MEDIAN(salary) GROUP BY department`    | 2.832s     | **0.580s** | **0.2x** |
 
-**NYC Taxi, 20M rows, 8 GB CSV** — raw CSV, no ingest, both engines: **~3.2x** faster, **~6x** less memory, and **0 bytes** of extra storage (DuckDB's fast path needs a 2.1 GB native store first). At this scale csvql reads raw CSV about as fast as `cat` — the read itself is the bound, not parsing.
+The last row is a real loss, not a rounding artefact: `MEDIAN` buffers every value in a group, so its memory and time are O(rows) rather than O(groups) ([#205](https://github.com/melihbirim/csvql/issues/205)).
+
+**Quoting changes the picture.** csvql skips 16 bytes at a time whenever no delimiter, newline or quote is present; a quoted field disables that and the lead narrows. Same files, differing only in whether one column is quoted, `COUNT(*)` with a `WHERE`, 12 threads:
+
+| | csvql | DuckDB | Speedup |
+| --- | --- | --- | --- |
+| unquoted | 11.9 to 15.0 GB/s | 1.3 to 2.2 GB/s | **6x to 9.5x** |
+| quoted | 3.0 to 4.6 GB/s | 1.2 to 2.1 GB/s | **2.2x to 2.6x** |
+
+Faster on every shape measured, and dramatically faster on machine-generated CSV, which mostly does not quote. Why, and the work in progress: [The Journey to 10x DuckDB](https://melihbirim.github.io/csvql/blog/journey-to-10x-duckdb-csv.html).
+
+**NYC Taxi, 20M rows, 8 GB CSV** — raw CSV, no ingest, both engines: **~3.2x** faster, **~6x** less memory, and **0 bytes** of extra storage (DuckDB's fast path needs a 2.1 GB native store first).
 
 Full breakdown (LIKE, multi-table JOIN, subqueries, memory/storage, methodology): **[BENCHMARKS.md](BENCHMARKS.md)**. Reproduce any number yourself: [`bench/bench_all.sh`](bench/bench_all.sh).
 
@@ -352,4 +365,4 @@ MIT — see [LICENSE.md](LICENSE.md).
 
 ---
 
-**Built with Zig** · **9x faster than DuckDB** · **MCP Server** · [GitHub](https://github.com/melihbirim/csvql)
+**Built with Zig** · **4-9x faster than DuckDB on raw CSV** · **MCP Server** · [GitHub](https://github.com/melihbirim/csvql)
