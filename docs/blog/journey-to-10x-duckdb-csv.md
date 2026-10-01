@@ -1,7 +1,7 @@
 ---
 layout: post
 title: "The Journey to 10x DuckDB on CSV Parsing and Querying"
-description: "csvql reads unquoted CSV 5 to 10 times faster than DuckDB on one thread. Add quotes and the lead vanishes completely. This is the running log of finding out why, including the fixes that did not work."
+description: "csvql reads unquoted CSV up to 12.7x faster than DuckDB on one thread. Add quotes and the lead used to vanish entirely. A running log of finding out why, the fixes that did not work, and the prefix XOR that did."
 date: 2026-10-01
 ---
 
@@ -106,11 +106,11 @@ Two theories died along the way, both worth not repeating:
 
 ---
 
-## What gets tried next
+## Update, 1 October: prefix XOR works, and we are not at 10x
 
-The fix has to restore skipping while quotes are present, which means knowing whether a byte is inside a quoted field without branching on each quote.
-
-That is a prefix XOR over the quote mask:
+The fix has to restore skipping while quotes are present, which means knowing
+whether a byte is inside a quoted field without branching on each quote. That is
+a prefix XOR over the quote mask:
 
 ```
 quote_mask  = chunk == '"'
@@ -118,21 +118,80 @@ in_quote    = prefix_xor(quote_mask) ^ carry_in
 structural  = (delim_mask | nl_mask) & ~in_quote
 ```
 
-`prefix_xor` is six shift-and-xor pairs on a 64-bit mask, or a single `PMULL` instruction against all ones on this hardware. No branch per quote, no restart, and `""` escapes cancel for free because two toggles are no toggle.
+Six shift-and-xor pairs on a 64-bit mask. No branch per quote, no restart, and
+`""` escapes cancel for free because two toggles are no toggle.
 
-One complication is real and has to be handled rather than waved at. Prefix XOR treats every quote as toggling, while csvql only opens a field on a quote at a field start, so a bare mid-field quote would be read differently. The plan is a cheap guard: a block where every quote is an opener, a closer, or half of an escape pair is well formed and takes the fast path; anything else falls back to the current scalar parser and stays correct.
+Measured on the scan alone, quoted input, 200 MB at each width:
 
-If that lands, the expectation is roughly 1 to 4 GB/s on quoted data at 256-byte fields, which would put csvql about 5x ahead of DuckDB on quoted CSV instead of level with it.
+| field width | scalar | prefix XOR | speedup |
+|---|---|---|---|
+| 16 B | 1.39 GB/s | 2.13 GB/s | 1.53x |
+| 64 B | 1.87 GB/s | 3.67 GB/s | 1.97x |
+| 256 B | 1.94 GB/s | 7.20 GB/s | 3.70x |
+| 1024 B | 2.11 GB/s | **9.75 GB/s** | 4.61x |
 
-After that there are two more levers, in order: branchless extraction of structural positions, which should help the narrow-field case where csvql is weakest today, and a simdjson-style structural index over a large block, which is the real ceiling and also the biggest change.
+The scalar column is flat. The prefix XOR column climbs with field width. That is
+the skipping coming back, which was the whole point.
 
----
+### The correctness problem, and how it was caught
+
+Prefix XOR toggles on every quote. csvql only opens a field on a quote at a field
+start, so the two disagree whenever a stray quote sits inside an unquoted field.
+The block now checks that every field the XOR view claims to open really is at a
+field start, and declines to the scalar parser otherwise.
+
+Getting that guard right took two attempts, and a differential test against the
+existing implementation found both:
+
+- The first version treated any run of adjacent quotes as escape pairs. A run of
+  three, `bq"""`, is an odd number, so one of them really does toggle. The test
+  shrank it to a 64-byte case within seconds.
+- The second version was correct but declined **100%** of records in any file
+  containing a `""` escape, which would have made the whole thing useless on real
+  data. The second quote of an escape pair reads as a fresh open to the XOR view,
+  so a preceding quote has to count as a valid opener too.
+
+Final behaviour, measured per record on realistic files:
+
+| file shape | fast path |
+|---|---|
+| plain unquoted | 99% |
+| every field quoted | 99% |
+| one quoted text column | 99% |
+| quoted with embedded comma | 99% |
+| quoted with embedded newline | 99% |
+| quoted with `""` escape | 99% |
+| stray mid-field quotes | 0%, correctly declines |
+
+300,000 random quote-heavy inputs produced zero disagreements with the scalar
+implementation.
+
+### So are we at 10x on quoted data
+
+No. One thread, `COUNT(*)` with a `WHERE`:
+
+| field width | csvql quoted | DuckDB quoted | ratio | csvql unquoted | DuckDB unquoted | ratio |
+|---|---|---|---|---|---|---|
+| 16 B | 0.94 GB/s | 0.38 GB/s | 2.5x | 0.96 GB/s | 0.35 GB/s | 2.7x |
+| 256 B | 1.53 GB/s | 0.97 GB/s | 1.6x | 3.94 GB/s | 0.73 GB/s | 5.4x |
+| 1024 B | 1.90 GB/s | 0.67 GB/s | 2.9x | 6.64 GB/s | 0.52 GB/s | **12.7x** |
+
+The 10x is real, and it is on unquoted data. On quoted data this moved csvql from
+dead level with DuckDB to roughly twice its speed, which is progress and is not
+the target.
+
+The remaining gap is against ourselves, not DuckDB: 1.53 GB/s quoted against 3.94
+GB/s unquoted at 256-byte fields. Record-end scanning is now fast. Field splitting
+still makes its own quote-aware pass over every quoted row, so the record is read
+twice: once to find where it ends, once to find where its fields are. The fused
+scan already computes both. Making the caller use what it computed is the next
+step, and it is worth roughly another 2x if the earlier experiments are any guide.
 
 ## Caveats
 
 - Every number here is single thread unless stated, measured on an M2 Pro against DuckDB 1.5.5, best of two or three runs, with the fixtures in page cache. They measure parse speed, not disk.
 - The claim that DuckDB uses a per-byte state machine is **inferred from its throughput curve**, not read from its source. A flat GB/s across a 64x change in field width is strong evidence for a scanner that never skips, but it is evidence, not a citation.
-- Nothing described here is currently shipped. The three attempts were reverted and `main` is unchanged.
+- The three attempts in the previous section were reverted. The prefix XOR work is on a branch and not yet merged.
 - The honest state of the comparison today: csvql is 5 to 10x faster than DuckDB on unquoted CSV on one thread, and level on quoted. The README's older "2.8x" figure comes from a specific benchmark file and should not be read as a general claim in either direction.
 
-This post will be updated as the prefix XOR work succeeds or fails. If it fails, that gets written down too.
+Next update will cover the field-splitting pass, which is where the remaining 2.6x against our own unquoted path lives.
