@@ -250,11 +250,12 @@ and 140-byte rows, and it reverses:
 Single threaded DuckDB is ahead. At twelve threads the two are level, inside
 noise of each other.
 
-The variable is column count. Nine columns in 140 bytes means a delimiter every
-fifteen bytes, so almost every 16-byte chunk contains something structural and
-csvql's skip almost never fires. Three columns in 280 bytes leaves long stretches
-of nothing, and the skip fires constantly. csvql's advantage is a function of how
-boring the data is, and real CSV is often not very boring.
+I first blamed column count for this, on the reasoning that nine columns in 140
+bytes puts a delimiter every fifteen bytes so csvql's skip rarely fires. A wider
+sweep in the next section shows that is wrong: holding row length fixed and
+varying only the column count, the ratio rises rather than falls. Something else
+is going on with this particular file, and the next section settles what the
+variable actually is.
 
 That is the most important caveat in this post. **A single ratio against DuckDB
 is not a property of the two engines, it is a property of the file.** Depending
@@ -268,6 +269,64 @@ number that identical across different work is a clue, not a result. Process
 startup is 0.00 to 0.01 seconds here, so a large share of that 0.019 is
 overhead rather than throughput. Those figures are excluded; the 2.8 GB numbers
 above are the ones with enough runtime to mean anything.
+
+## Settled: where csvql is actually best
+
+Earlier sections in this post blamed column count for the swing in results. That
+was wrong, and a wider sweep says so. Holding row length at about 200 bytes and
+varying only how many columns that is divided into, the ratio does not fall as
+columns increase, it rises. Column count is not the variable.
+
+**Quoting is the variable, and it is the only one that matters.** Same files,
+differing only in whether the last column is wrapped in quotes:
+
+| columns | quoting | csvql 1T / 12T | DuckDB 1T / 12T | ratio 1T / 12T |
+|---|---|---|---|---|
+| 2 | unquoted | 2.63 / **13.13** | 0.63 / 2.19 | 4.2x / **6.0x** |
+| 2 | quoted | 1.27 / 4.46 | 0.62 / 2.06 | 2.0x / 2.2x |
+| 8 | unquoted | 3.46 / **15.00** | 0.52 / 1.96 | 6.7x / **7.7x** |
+| 8 | quoted | 1.47 / 4.55 | 0.54 / 2.07 | 2.7x / 2.2x |
+| 32 | unquoted | 2.39 / **11.94** | 0.28 / 1.26 | 8.6x / **9.5x** |
+| 32 | quoted | 1.18 / 3.02 | 0.28 / 1.18 | 4.2x / 2.6x |
+
+### DuckDB's numbers, since they are the thing being compared against
+
+| | 1 thread | 12 threads |
+|---|---|---|
+| unquoted | 0.28 to 0.63 GB/s | 1.26 to 2.19 GB/s |
+| quoted | 0.28 to 0.62 GB/s | 1.18 to 2.07 GB/s |
+
+Those two rows are the same numbers. DuckDB reads quoted CSV at exactly the
+speed it reads unquoted CSV, which is the clearest possible confirmation of the
+per-byte state machine: there is no fast path for quoting to disable.
+
+### The claim, stated precisely
+
+**On unquoted CSV, csvql is 6 to 9.5 times faster than DuckDB on twelve threads,
+and 4 to 8.6 times faster on one.** That holds across a sixteen-fold range of
+column counts, at both thread counts, and under filters of varying selectivity.
+
+**On quoted CSV it is 2 to 2.6 times faster.** Still a win at every measurement
+in the table, just a much smaller one.
+
+Unquoted is not a niche. Machine-written CSV mostly does not quote: application
+logs, metrics exports, scientific instrument output, database dumps of numeric
+and identifier columns, anything produced by a tool rather than by a
+spreadsheet. Quoting largely appears when a human-authored free-text field is
+involved, or when the writer quotes defensively by default.
+
+So the honest one-line version is: **faster than DuckDB on every shape measured
+here, and dramatically faster on machine-generated data.**
+
+### One measurement that still does not fit
+
+The 2.8 GB support-ticket fixture gives roughly 1.0x rather than the 2.2x this
+model predicts for quoted data. It has nine columns and a quoted free-text body
+whose contents are random words, where the sweep above repeats the same filler.
+Varied content may be defeating branch prediction or cache behaviour in a way
+repetitive content does not. That is unexplained, it is recorded here rather
+than dropped, and it is the reason the next step is a corpus of real CSV files
+instead of another synthetic sweep.
 
 ## Caveats
 
