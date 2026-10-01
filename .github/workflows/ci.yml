@@ -45,7 +45,7 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Setup Zig
-      uses: goto-bus-stop/setup-zig@v2
+      uses: ./.github/actions/setup-zig
       with:
         version: 0.15.2
 
@@ -93,7 +93,7 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Setup Zig
-      uses: goto-bus-stop/setup-zig@v2
+      uses: ./.github/actions/setup-zig
       with:
         version: 0.15.2
 
@@ -112,7 +112,7 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Setup Zig
-      uses: goto-bus-stop/setup-zig@v2
+      uses: ./.github/actions/setup-zig
       with:
         version: 0.15.2
 
@@ -200,7 +200,7 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Setup Zig
-      uses: goto-bus-stop/setup-zig@v2
+      uses: ./.github/actions/setup-zig
       with:
         version: 0.15.2
 
@@ -303,7 +303,7 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Setup Zig
-      uses: goto-bus-stop/setup-zig@v2
+      uses: ./.github/actions/setup-zig
       with:
         version: 0.15.2
 
