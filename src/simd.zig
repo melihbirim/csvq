@@ -116,51 +116,109 @@ pub fn scanRecordFused(data: []const u8, start: usize, delimiter: u8, positions:
 
     var comma_count: usize = 0;
     var i: usize = start;
+    var saw_quote = false;
+    var in_quote = false;
 
-    while (i + VecSize <= data.len) : (i += VecSize) {
+    while (i + VecSize <= data.len) {
         const chunk: Vec = data[i..][0..VecSize].*;
-        const nl_matches: @Vector(VecSize, bool) = chunk == nl_vec;
-        const q_matches: @Vector(VecSize, bool) = chunk == q_vec;
-        const delim_matches: @Vector(VecSize, bool) = chunk == delim_vec;
+        const q_mask: u16 = @bitCast(@as(@Vector(VecSize, bool), chunk == q_vec));
 
-        const nl_mask: u16 = @bitCast(nl_matches);
-        const q_mask: u16 = @bitCast(q_matches);
-        const delim_mask: u16 = @bitCast(delim_matches);
+        // Inside a quoted field only the closing quote matters. A chunk with no
+        // quote byte is skipped whole, which is what makes long quoted text scan
+        // at full width instead of being handed to a byte loop. This used to
+        // return immediately on any quote and let the caller re-scan the record
+        // from the start with a scalar parser.
+        if (in_quote) {
+            if (q_mask == 0) {
+                i += VecSize;
+                continue;
+            }
+            var m = q_mask;
+            while (m != 0) {
+                const bit = @ctz(m);
+                const pos = i + bit;
+                if (pos + 1 < data.len and data[pos + 1] == '"') {
+                    // "" escape: stays inside the field, skip the pair.
+                    m &= ~(@as(u16, 1) << @intCast(bit));
+                    if (bit + 1 < VecSize) m &= ~(@as(u16, 1) << @intCast(bit + 1));
+                    continue;
+                }
+                in_quote = false;
+                // Resume immediately after the closing quote; the rest of this
+                // chunk has to be re-examined outside quote state.
+                i = pos + 1;
+                break;
+            } else {
+                i += VecSize; // only escaped pairs in this chunk, still inside
+            }
+            continue;
+        }
 
+        const nl_mask: u16 = @bitCast(@as(@Vector(VecSize, bool), chunk == nl_vec));
+        const delim_mask: u16 = @bitCast(@as(@Vector(VecSize, bool), chunk == delim_vec));
         const combined: u16 = nl_mask | q_mask | delim_mask;
-        if (combined == 0) continue;
+        if (combined == 0) {
+            i += VecSize;
+            continue;
+        }
 
-        // Walk set bits lowest-first (@ctz) so the first quote/newline byte
-        // in the chunk is the one we act on, not just any match.
         var m = combined;
         while (m != 0) {
             const bit = @ctz(m);
             const bitval: u16 = @as(u16, 1) << @intCast(bit);
+            const pos = i + bit;
             if (q_mask & bitval != 0) {
-                return .{ .end = null, .comma_count = comma_count, .had_quote = true };
+                // Only a quote at the start of a field opens one; elsewhere it is
+                // an ordinary byte, matching findRecordEndScalar.
+                const at_field_start = pos == start or data[pos - 1] == delimiter;
+                if (at_field_start) {
+                    saw_quote = true;
+                    in_quote = true;
+                    i = pos + 1;
+                    break;
+                }
+                saw_quote = true;
+                m &= m - 1;
+                continue;
             }
             if (nl_mask & bitval != 0) {
-                return .{ .end = i + bit, .comma_count = comma_count, .had_quote = false };
+                return .{ .end = pos, .comma_count = comma_count, .had_quote = saw_quote };
             }
             if (comma_count < positions.len) {
-                positions[comma_count] = i + bit;
+                positions[comma_count] = pos;
                 comma_count += 1;
             }
             m &= m - 1;
+        } else {
+            i += VecSize; // walked every set bit without leaving this chunk
         }
     }
 
     // Scalar tail for the remaining < 16 bytes.
     while (i < data.len) : (i += 1) {
         const c = data[i];
-        if (c == '"') return .{ .end = null, .comma_count = comma_count, .had_quote = true };
-        if (c == '\n') return .{ .end = i, .comma_count = comma_count, .had_quote = false };
+        if (in_quote) {
+            if (c == '"') {
+                if (i + 1 < data.len and data[i + 1] == '"') {
+                    i += 1;
+                    continue;
+                }
+                in_quote = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            saw_quote = true;
+            if (i == start or data[i - 1] == delimiter) in_quote = true;
+            continue;
+        }
+        if (c == '\n') return .{ .end = i, .comma_count = comma_count, .had_quote = saw_quote };
         if (c == delimiter and comma_count < positions.len) {
             positions[comma_count] = i;
             comma_count += 1;
         }
     }
-    return .{ .end = null, .comma_count = comma_count, .had_quote = false };
+    return .{ .end = null, .comma_count = comma_count, .had_quote = saw_quote };
 }
 
 /// Quote-aware CSV field splitter into a caller-supplied static buffer.

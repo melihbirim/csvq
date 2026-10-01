@@ -1185,29 +1185,6 @@ fn scalarProcessChunk(ctx: *ScalarWorkerCtx) !void {
 
             _ = row_arena.reset(.retain_capacity);
 
-            if (fused.had_quote) {
-                const nl = csv.findRecordEnd(work, scan, ctx.delimiter) orelse {
-                    try seam_buf.appendSlice(ctx.allocator, work[scan..]);
-                    break;
-                };
-                var line: []const u8 = work[scan..nl];
-                if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-                scan = nl + 1;
-                if (line.len == 0) continue;
-
-                // Parse all fields (quote-aware: commas/newlines inside quotes don't
-                // split the row, surrounding quotes are stripped) — issue #93.
-                const n_fields = simd.parseCSVFieldsStatic(line, &field_buf, ctx.delimiter) catch continue;
-                const fields = field_buf[0..n_fields];
-                for (fields) |*f| {
-                    if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
-                        f.* = unescapeQuotesArenaAlloc(row_arena.allocator(), f.*) catch f.*;
-                    }
-                }
-                try scalarProcessRecord(ctx, &row_arena, fields);
-                continue;
-            }
-
             const abs_end = fused.end orelse {
                 try seam_buf.appendSlice(ctx.allocator, work[scan..]);
                 break;
@@ -1227,6 +1204,12 @@ fn scalarProcessChunk(ctx: *ScalarWorkerCtx) !void {
             }
             field_buf[count] = work[s..content_end];
             count += 1;
+            // Quoted rows take the same split as unquoted ones; only the fields
+            // need unwrapping. This used to re-scan the record with
+            // findRecordEnd and re-parse it with parseCSVFieldsStatic.
+            if (fused.had_quote) {
+                for (field_buf[0..count]) |*f| f.* = unquoteField(row_arena.allocator(), f.*);
+            }
             try scalarProcessRecord(ctx, &row_arena, field_buf[0..count]);
         }
     }
@@ -2855,6 +2838,19 @@ fn columnLookupError(expr: []const u8) anyerror {
 /// Only called when the field is known to contain `""` — see issue #89.
 /// Used by the parallel worker threads (#93), which each reset their own
 /// per-row arena so this never accumulates across rows.
+/// Strip a field's surrounding quotes and unescape "" inside it.
+///
+/// The fused scan already reports where the fields are, including when they are
+/// quoted, because it excludes delimiters found inside a quoted field. So a
+/// quoted row needs the same split as an unquoted one plus this per field, not
+/// a second full parse of the record.
+inline fn unquoteField(arena: Allocator, f: []const u8) []const u8 {
+    var v = f;
+    if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v = v[1 .. v.len - 1];
+    if (std.mem.indexOf(u8, v, "\"\"") == null) return v;
+    return unescapeQuotesArenaAlloc(arena, v) catch v;
+}
+
 fn unescapeQuotesArenaAlloc(alloc: Allocator, field: []const u8) ![]const u8 {
     const out = try alloc.alloc(u8, field.len);
     var w: usize = 0;
