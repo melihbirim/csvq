@@ -120,3 +120,4 @@ Earlier rows are left blank under the same policy as `Distinct` above.
 | 2026-09-28 | 2667231988 | 50000 | 46275 | 19633 | 2 | 2.7.0 | 1.5.5 | `./bench/query_fuzz.sh --seed 2667231988 --count 50000` | see tests/regressions/ from this run's artifact |
 | 2026-09-29 | 30241739 | 50000 | 46293 | 19769 | 0 | 2.7.0 | 1.5.5 | `./bench/query_fuzz.sh --seed 30241739 --count 50000` |  |
 | 2026-09-30 | 323616520 | 50000 | 46276 | 19600 | 0 | 2.7.0 | 1.5.5 | `./bench/query_fuzz.sh --seed 323616520 --count 50000` |  |
+| 2026-10-01 | 3082013191 | 50000 | 46349 | 19753 | 0 | 2.7.0 | 1.5.5 | `./bench/query_fuzz.sh --seed 3082013191 --count 50000` |  |
