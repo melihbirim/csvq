@@ -4420,6 +4420,11 @@ const GbWorkerCtx = struct {
     /// workers only need the key set, so they share one instead of each
     /// building a private map for the main thread to merge.
     distinct_keys: ?*ShardedDistinctSet = null,
+    /// Worker-local keys, used before the shared set. A DISTINCT over a column
+    /// with few values sends every row to the same handful of shards, and the
+    /// mutex contention made 12 threads slower than 4. Accumulating locally
+    /// first means a low-cardinality DISTINCT never touches a lock.
+    local_distinct: ?std.StringHashMap(void) = null,
     partial_map: std.StringHashMap(CompactAccum),
     err: ?anyerror = null,
 };
@@ -4883,6 +4888,17 @@ fn gbProcessRecordCore(
     // No aggregates: the key is the whole result, so there is nothing to
     // accumulate and no per-group CompactAccum to allocate.
     if (ctx.distinct_keys) |set| {
+        // Local until this worker has seen enough distinct values that sharing
+        // is worth a lock; below that the whole DISTINCT stays contention-free.
+        if (ctx.local_distinct) |*local| {
+            if (local.count() < shared_groups_threshold) {
+                const gop = try local.getOrPut(key_buf.items);
+                if (!gop.found_existing) {
+                    gop.key_ptr.* = try aa.dupe(u8, key_buf.items);
+                }
+                return;
+            }
+        }
         try set.add(key_buf.items);
         return;
     }
@@ -4944,6 +4960,7 @@ fn gbWorkerThread(ctx: *GbWorkerCtx) void {
 
 fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
     const aa = ctx.arena.allocator();
+    if (ctx.distinct_keys != null) ctx.local_distinct = std.StringHashMap(void).init(aa);
     ctx.opt_slots = try OptionalSlots.forSpecs(aa, ctx.agg_specs, ctx.n_aggs);
     ctx.partial_map = std.StringHashMap(CompactAccum).init(aa);
     // Per-thread map pre-sizing based on chunk byte range
@@ -6084,6 +6101,15 @@ fn executeGroupBy(
         }
 
         if (key_set) |*ks| {
+            // Fold each worker's local keys in. Bounded by n_threads *
+            // shared_groups_threshold, and for the common low-cardinality case
+            // this is the only place the shared set is touched at all.
+            for (thread_ctxs) |*ctx| {
+                if (ctx.local_distinct) |*local| {
+                    var it = local.keyIterator();
+                    while (it.next()) |k| try ks.add(k.*);
+                }
+            }
             for (thread_ctxs) |*ctx| ctx.arena.deinit();
             try emitDistinctKeys(allocator, ks, &writer, query, opts);
             return;
