@@ -177,6 +177,17 @@ The speedup is steady across a sixteen-fold range of column counts. Quoting is t
 
 Faster on every shape measured here, and dramatically faster on machine-generated CSV, which mostly does not quote. Reproduce with [`bench/bench_scaling.sh`](bench/bench_scaling.sh). Why, and the work in progress: [The Journey to 10x DuckDB](https://melihbirim.github.io/csvql/blog/journey-to-10x-duckdb-csv.html).
 
+**As a library, against pandas and polars.** Same query, same file, all three in-process, so this measures the engines and not process startup. `SELECT department, COUNT(*), AVG(salary) ... GROUP BY department` on 2M rows / 72.6 MB, median of 9 runs; peak RSS measured in a separate single-run process:
+
+| Library | Seconds | vs csvql | Peak RSS | vs csvql |
+| --- | --- | --- | --- | --- |
+| csvql (Node) | **0.012483** | 0.88x | 94.9 MB | 1.26x |
+| csvql (Python) | **0.014196** | 1.00x | **75.5 MB** | 1.00x |
+| polars | 0.033741 | 2.38x | 300.4 MB | 3.98x |
+| pandas | 0.543426 | 38.28x | 414.4 MB | 5.49x |
+
+csvql's peak memory is roughly the size of the file; pandas and polars materialise a DataFrame first. `csvql.query()` is an in-process call into the same Zig engine the CLI uses, not a subprocess. Reproduce with [`bench/bench_libs.py`](bench/bench_libs.py).
+
 **NYC Taxi, 20M rows, 8 GB CSV** — raw CSV, no ingest, both engines: **~3.2x** faster, **~6x** less memory, and **0 bytes** of extra storage (DuckDB's fast path needs a 2.1 GB native store first).
 
 Full breakdown (LIKE, multi-table JOIN, subqueries, memory/storage, methodology): **[BENCHMARKS.md](BENCHMARKS.md)**. Reproduce any number yourself: [`bench/bench_all.sh`](bench/bench_all.sh).
