@@ -236,8 +236,38 @@ combination of both costs, a quoted scan feeding a projection. The fused scan
 now avoids re-parsing those rows, which is where the 15 to 25% in the last
 change came from, but it is not yet enough to close this one.
 
-That row is the honest headline for quoted data, and it is why "10x" in the
-title of this post is a destination rather than a description.
+### And then the shape of the file changes the answer again
+
+Everything above uses a three-column file with a 256-byte text column. Run the
+same comparison against the 2.8 GB support-ticket fixture, which has nine columns
+and 140-byte rows, and it reverses:
+
+| | csvql | DuckDB |
+|---|---|---|
+| 1 thread | 0.44 GB/s | **0.52 GB/s** |
+| 12 threads | **3.48 GB/s** | 3.44 GB/s |
+
+Single threaded DuckDB is ahead. At twelve threads the two are level, inside
+noise of each other.
+
+The variable is column count. Nine columns in 140 bytes means a delimiter every
+fifteen bytes, so almost every 16-byte chunk contains something structural and
+csvql's skip almost never fires. Three columns in 280 bytes leaves long stretches
+of nothing, and the skip fires constantly. csvql's advantage is a function of how
+boring the data is, and real CSV is often not very boring.
+
+That is the most important caveat in this post. **A single ratio against DuckDB
+is not a property of the two engines, it is a property of the file.** Depending
+on column count, field width, quoting and thread count, the same two binaries
+land anywhere between 0.8x and 13x on the measurements here.
+
+One measurement that did not survive scrutiny, recorded because the mistake is
+easy to repeat: at twelve threads the 371 MB fixtures finish in 0.019 seconds,
+and both the quoted and unquoted variants reported an identical 19.43 GB/s. A
+number that identical across different work is a clue, not a result. Process
+startup is 0.00 to 0.01 seconds here, so a large share of that 0.019 is
+overhead rather than throughput. Those figures are excluded; the 2.8 GB numbers
+above are the ones with enough runtime to mean anything.
 
 ## Caveats
 
