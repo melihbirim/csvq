@@ -41,6 +41,11 @@ description: "Notes on building csvql, an analytical CSV query engine for AI age
 </header>
 
 <main class="wrap">
+  <a class="post" href="csvql-vs-polars.html">
+    <div class="date">2026-10-05</div>
+    <h2>csvql vs polars: The Memory Stays Flat</h2>
+    <p>polars is what people move to when pandas gets slow, and it is genuinely fast. On the same queries csvql is 1.5 to 3.2x ahead of it, and uses 17x less memory on a 746 MB file, because it never loads the file.</p>
+  </a>
   <a class="post" href="journey-to-10x-duckdb-csv.html">
     <div class="date">2026-10-01</div>
     <h2>The Journey to 10x DuckDB on CSV Parsing and Querying</h2>
