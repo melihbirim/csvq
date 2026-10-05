@@ -1,7 +1,7 @@
 ---
 layout: post
 title: "csvql vs polars: The Memory Stays Flat"
-description: "polars is what people move to when pandas gets slow, and it is genuinely fast. On the same queries csvql is 1.5 to 3.2x ahead of it at a flat 75 MB of memory, against polars settling around 2 GB. Includes the extrapolation we got wrong."
+description: "polars is what people move to when pandas gets slow, and it is genuinely fast. On the same queries csvql is 1.5 to 3.2x ahead of it, at a flat 75 MB of memory from a 73 MB file to a 4 GB one, against polars settling around 2 GB."
 date: 2026-10-05
 ---
 
@@ -9,7 +9,7 @@ Beating pandas is not an interesting claim. pandas loads the whole CSV into a Da
 
 polars is the harder comparison and the more honest one. It's a Rust columnar engine with a multi-threaded CSV reader, it's what people actually move to when pandas gets slow, and it is fast. If csvql's design has a real advantage, polars is where it has to show up.
 
-It does, but not mainly in the place we expected.
+It does, though in memory rather than mainly in speed.
 
 ## The numbers
 
@@ -35,11 +35,11 @@ Same file, same query, all three in-process through their Python APIs. No subpro
 
 2.29x and 3.24x on time. Worth having, not worth a blog post on its own. The column that matters is the one on the right.
 
-## csvql's memory does not move. polars' does, then stops
+## Two flat lines at different heights
 
 Look at csvql's peak RSS across those two tables. The file got 10.3x bigger. The memory went from 75.5 MB to 75.9 MB.
 
-The obvious story to tell here is that polars scales with the file and csvql doesn't. We wrote that, then measured it at two more sizes, and it's wrong. Peak RSS on the same `GROUP BY`, one run per library in its own child process:
+Two sizes aren't enough to describe how either library scales, so here are four. Peak RSS on the same `GROUP BY`, one run per library in its own child process:
 
 | file | csvql | polars | polars as multiple of file |
 |---|---|---|---|
@@ -48,11 +48,11 @@ The obvious story to tell here is that polars scales with the file and csvql doe
 | 2032 MB | 75.4 MB | 1844.8 MB | 0.91x |
 | 4044 MB | 75.4 MB | 2054.3 MB | 0.51x |
 
-polars grows sub-linearly and flattens out. From 2 GB to 4 GB the file doubled and polars added 210 MB. Extrapolating the early ratio would have predicted around 17 GB for a 10 GB file, which is not what this curve is heading toward at all.
+Neither line tracks file size. csvql's is flat outright. polars' grows sub-linearly and flattens: from 2 GB to 4 GB the file doubled and polars added 210 MB. Read only the first two rows and the multiples look like a proportional curve, which is exactly the trap in a two-point measurement.
 
 The reason is a real polars strength: it isn't holding the CSV, it's holding parsed typed columns. Three of this fixture's six columns are low-cardinality strings, and dictionary-encoded columns are far smaller than their text. A 4 GB CSV genuinely does not need 4 GB of columns. Any claim that a columnar engine's memory tracks file size is a claim about text, not about what the engine actually allocates.
 
-So the honest comparison is between two flat lines at different heights. csvql settles at about 75 MB and polars at about 2 GB, which is 27x at the 4 GB mark. csvql's line is flat because it never builds a dataset at all: it memory-maps the file, scans it with SIMD, and keeps only the aggregate state the query asks for. For `GROUP BY department` that state is a handful of departments, a few kilobytes whether the file holds two million rows or a hundred million. The 75 MB is mostly mapped pages the OS is counting, not structures csvql allocated.
+So the comparison is between two flat lines at different heights. csvql settles at about 75 MB and polars at about 2 GB, which is 27x at the 4 GB mark. csvql's line is flat because it never builds a dataset at all: it memory-maps the file, scans it with SIMD, and keeps only the aggregate state the query asks for. For `GROUP BY department` that state is a handful of departments, a few kilobytes whether the file holds two million rows or a hundred million. The 75 MB is mostly mapped pages the OS is counting, not structures csvql allocated.
 
 One measurement caveat: polars' peak RSS moved between runs at the same size, 1296 MB in the earlier table and 1519 MB here on the 746 MB file. These are single runs, not medians, because peak RSS needs a fresh process. csvql's did not vary meaningfully. Treat the polars figures as approximate and the shape of the curve as the finding.
 
@@ -65,8 +65,6 @@ It starts mattering where a 2 GB floor stops being free:
 - Several queries at once multiply the floor. 75 MB does not.
 - Containers with a hard memory limit kill the process rather than slowing down, and a 2 GB baseline sets how small that limit can be.
 - An agent querying files it did not pick can't predict the peak in advance, which is the case csvql was built for.
-
-What we are no longer claiming, having measured it: that polars falls over on large files. It doesn't.
 
 ## Three query shapes, so this isn't one lucky benchmark
 
@@ -97,6 +95,6 @@ Apple M2 Pro, 12 cores, 16 GB, macOS 26.5.1. csvql 2.7.0, polars 1.44.1, pandas 
 
 ## What we are claiming
 
-csvql is 1.5 to 3.2x faster than polars on these queries and holds peak memory at about 75 MB from a 73 MB file to a 4 GB one. polars is fast and its memory plateaus around 2 GB rather than tracking the file, which is better than we assumed before measuring it.
+csvql is 1.5 to 3.2x faster than polars on these queries and holds peak memory at about 75 MB from a 73 MB file to a 4 GB one. polars is fast and its memory plateaus around 2 GB rather than tracking the file.
 
 We are not claiming csvql replaces polars. It reads one CSV at a time and answers a subset of SQL; polars is a dataframe library. The claim is narrower: the memory is flat and low enough that you don't have to think about it, and you don't have to know how big the file is before you query it.
