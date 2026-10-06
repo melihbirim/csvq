@@ -1,7 +1,7 @@
 {
   "name": "csvql-query",
-  "version": "2.7.0",
-  "description": "SQL on CSV files in place — no import, no database. Zig/SIMD engine for Node and AI agents (MCP). Read-only by design.",
+  "version": "2.8.0",
+  "description": "Run SQL on CSV files in place. Query large CSV files fast with no import and no database. A CSV SQL engine in Zig with SIMD parsing, for Node and AI agents (MCP). Read only by design.",
   "main": "index.js",
   "types": "index.d.ts",
   "bin": {
