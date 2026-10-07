@@ -177,16 +177,32 @@ The speedup is steady across a sixteen-fold range of column counts. Quoting is t
 
 Faster on every shape measured here, and dramatically faster on machine-generated CSV, which mostly does not quote. Reproduce with [`bench/bench_scaling.sh`](bench/bench_scaling.sh). Why, and the work in progress: [The Journey to 10x DuckDB](https://melihbirim.github.io/csvql/blog/journey-to-10x-duckdb-csv.html).
 
-**As a library, against pandas and polars.** Same query, same file, all three in-process, so this measures the engines and not process startup. `SELECT department, COUNT(*), AVG(salary) ... GROUP BY department` on 2M rows / 72.6 MB, median of 9 runs; peak RSS measured in a separate single-run process:
+**As a library, against polars 2.0 and DuckDB.** One query per process so nothing is cached between calls, engines interleaved round by round, first round discarded because it pays for page cache. polars is driven through `scan_csv` (lazy), which is its recommended path for a file on disk and the faster of its two APIs on every shape here. 20M rows / 711 MB, median of 5:
 
-| Library | Seconds | vs csvql | Peak RSS | vs csvql |
-| --- | --- | --- | --- | --- |
-| csvql (Node) | **0.012483** | 0.88x | 94.9 MB | 1.26x |
-| csvql (Python) | **0.014196** | 1.00x | **75.5 MB** | 1.00x |
-| polars | 0.033741 | 2.38x | 300.4 MB | 3.98x |
-| pandas | 0.543426 | 38.28x | 414.4 MB | 5.49x |
+| Query shape | csvql | polars 2.0 | DuckDB | vs polars | vs DuckDB |
+| --- | --- | --- | --- | --- | --- |
+| `SUM(salary)` | **0.0807** | 0.2268 | 0.3716 | **2.8x** | **4.6x** |
+| `COUNT(*) GROUP BY department` | **0.1241** | 0.3173 | 0.4978 | **2.6x** | **4.0x** |
+| `COUNT(*) WHERE city = '...'` | **0.0804** | 0.2818 | 0.4351 | **3.5x** | **5.4x** |
+| `LIMIT 10`, no sort | **0.0011** | 0.0029 | 0.0662 | **2.7x** | **60.9x** |
+| `COUNT(*)` | 0.0256 | **0.0220** | 0.4005 | 0.9x | **15.6x** |
+| `ORDER BY salary LIMIT 10` | 0.3440 | **0.3047** | 0.4197 | 0.9x | **1.2x** |
 
-csvql's peak memory is roughly the size of the file; pandas and polars materialise a DataFrame first. `csvql.query()` is an in-process call into the same Zig engine the CLI uses, not a subprocess. Reproduce with [`bench/bench_libs.py`](bench/bench_libs.py).
+pandas is not in this table because it has no lazy API to compare against on equal terms; measured separately on the same `GROUP BY` and files, it takes 0.543426s at 2M rows and 6.720655s at 20M, so 39x and 60x. That margin says more about `read_csv` loading the whole file into a DataFrame first than about either engine.
+
+The last two rows are losses to polars, stated because leaving them out would make the table a sales sheet. `COUNT(*)` is bandwidth-bound for both engines at this size: counting records means reading every byte and CSV carries no row count to shortcut to, so at ~0.026s for 711 MB there is nothing left to win. `ORDER BY ... LIMIT` is a draw after [#224](https://github.com/melihbirim/csvql/pull/224) pushed the limit into the sort workers; before that it was ~6x worse.
+
+**Where the gap is widest: wide files.** csvql finds the fields a query names and skips the rest of each row, while a reader that materialises columns pays for all of them. 757 MB, 60 columns, `SUM` of one column at position 58:
+
+| Engine | Seconds | vs csvql |
+| --- | --- | --- |
+| csvql | **0.0563** | 1.00x |
+| polars 2.0 | 0.2187 | 3.9x |
+| DuckDB | 0.5767 | 10.2x |
+
+**Memory.** On aggregates csvql holds a running accumulator rather than a dataset, so peak memory is flat in file size. On the same 711 MB file, `GROUP BY department`: csvql **54 MB**, polars 2.0 **1110 MB**. This is a property of aggregate queries, not of every query: `ORDER BY` has to hold rows, and the same file peaks at 715 MB.
+
+Reproduce with [`bench/bench_vs_polars.sh`](bench/bench_vs_polars.sh). Full working and the corrections to an earlier version of these numbers: [csvql vs polars](https://melihbirim.github.io/csvql/blog/csvql-vs-polars.html).
 
 **NYC Taxi, 20M rows, 8 GB CSV** — raw CSV, no ingest, both engines: **~3.2x** faster, **~6x** less memory, and **0 bytes** of extra storage (DuckDB's fast path needs a 2.1 GB native store first).
 
