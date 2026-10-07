@@ -4,6 +4,7 @@ const csv = @import("csv.zig");
 const bulk_csv = @import("bulk_csv.zig");
 const mmap_engine = @import("mmap_engine.zig");
 const parallel_mmap = @import("parallel_mmap.zig");
+const fast_count = @import("fast_count.zig");
 const fast_sort = @import("fast_sort.zig");
 const aggregation = @import("aggregation.zig");
 const simd = @import("simd.zig");
@@ -4052,7 +4053,27 @@ fn executeScalarAgg(
 
     // -- Scan (parallel on large files, sequential on small) --
     const num_cores_sa = options_mod.effectiveThreadCount(opts);
-    if (num_cores_sa > 1 and file_size > 10 * 1024 * 1024) {
+
+    // `SELECT COUNT(*)` with nothing to filter on needs record boundaries and
+    // nothing else, so it does not have to split a single field. fast_count
+    // counts newlines outside quoted fields straight off the bytes (#226).
+    // Everything else -- a WHERE, a second aggregate, COUNT(col), CASE WHEN --
+    // needs the fields, so it falls through to the general scan below.
+    const bare_count_star = query.where_expr == null and
+        query.having_expr == null and
+        n_aggs == 1 and
+        agg_specs.items[0].func_type == .count and
+        agg_specs.items[0].col_idx == null and
+        agg_specs.items[0].case_when == null;
+
+    if (bare_count_star) {
+        accum.count = @intCast(try fast_count.countRecords(
+            allocator,
+            data[hinfo.data_start..],
+            false, // data_start already skips the header
+            num_cores_sa,
+        ));
+    } else if (num_cores_sa > 1 and file_size > 10 * 1024 * 1024) {
         const n_threads = num_cores_sa;
         const chunks = try splitLineChunks(data, hinfo.data_start, n_threads, allocator, opts.delimiter);
         defer allocator.free(chunks);
