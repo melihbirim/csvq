@@ -167,6 +167,29 @@ Engine versions: csvql **2.6.2**, Polars **2.0.0-rc.1**.
 
 Reproduce: `bench/.venv-polars/bin/python3 bench/bench_polars.py` (needs the fixture already cached by `bench_taxi.sh --sample`).
 
+### Polars 2.0.0 final (October 2026)
+
+2.0.0 shipped on 6 October 2026. The rc numbers above are kept as the pinned historical measurement; these are the current ones, on a different fixture and harness, so they are not a like-for-like update of the two rows above.
+
+20M rows / 711 MB, one query per process, engines interleaved, first round discarded, median of 5. Engine versions: csvql **2.8.1** plus the `COUNT(*)` change, Polars **2.0.0**, DuckDB **1.5.6**.
+
+| Query shape | csvql | Polars 2.0 | DuckDB | vs Polars | vs DuckDB |
+| --- | --- | --- | --- | --- | --- |
+| `SUM(salary)` | **0.0807** | 0.2268 | 0.3716 | **2.8x** | **4.6x** |
+| `COUNT(*) GROUP BY department` | **0.1241** | 0.3173 | 0.4978 | **2.6x** | **4.0x** |
+| `COUNT(*) WHERE city = '...'` | **0.0804** | 0.2818 | 0.4351 | **3.5x** | **5.4x** |
+| `LIMIT 10`, no sort | **0.0011** | 0.0029 | 0.0662 | **2.7x** | **60.9x** |
+| `COUNT(*)` | 0.0256 | **0.0220** | 0.4005 | 0.9x | **15.6x** |
+| `ORDER BY salary LIMIT 10` | 0.3440 | **0.3047** | 0.4197 | 0.9x | **1.2x** |
+
+Wide file, 757 MB / 60 columns, `SUM` of one column at position 58: csvql **0.0563s**, Polars 0.2187s (**3.9x**), DuckDB 0.5767s (**10.2x**).
+
+Peak RSS on `GROUP BY department`, 711 MB file: csvql **54 MB**, Polars 1110 MB. On `ORDER BY salary DESC LIMIT 10` the same file peaks at 715 MB in csvql, because sorts hold rows while aggregates hold an accumulator.
+
+Note on the Polars API: `pl.read_csv` (eager) got slower in 2.0 while `pl.scan_csv` (lazy) got much faster, by 3.8x on top-N. These figures use `scan_csv`. Benchmarking the eager path overstates csvql by up to 7x on sorts, which is a mistake we made and corrected in [csvql vs polars](https://melihbirim.github.io/csvql/blog/csvql-vs-polars.html).
+
+Reproduce: `./bench/bench_vs_polars.sh fixture.csv 6`.
+
 ## How is csvql so fast?
 
 - **Memory-mapped I/O** — zero-copy reading at 1.4 GB/sec

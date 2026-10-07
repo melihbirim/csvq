@@ -5,6 +5,8 @@ description: "polars is what people move to when pandas gets slow, and it is gen
 date: 2026-10-05
 ---
 
+*Updated 2026-10-07: two numbers in this post were wrong. The original text is unchanged; see [the update at the end](#update-2026-10-07-polars-20-and-two-numbers-above-that-were-wrong).*
+
 Beating pandas is not an interesting claim. pandas loads the whole CSV into a DataFrame before it will answer anything, so any engine that doesn't do that wins by a margin that says more about the comparison than the engine. We [wrote that post](csvql-vs-pandas.html) and the number was 17 to 76x.
 
 polars is the harder comparison and the more honest one. It's a Rust columnar engine with a multi-threaded CSV reader, it's what people actually move to when pandas gets slow, and it is fast. If csvql's design has a real advantage, polars is where it has to show up.
@@ -98,3 +100,108 @@ Apple M2 Pro, 12 cores, 16 GB, macOS 26.5.1. csvql 2.7.0, polars 1.44.1, pandas 
 csvql is 1.5 to 3.2x faster than polars on these queries and holds peak memory at about 75 MB from a 73 MB file to a 4 GB one. polars is fast and its memory plateaus around 2 GB rather than tracking the file.
 
 We are not claiming csvql replaces polars. It reads one CSV at a time and answers a subset of SQL; polars is a dataframe library. The claim is narrower: the memory is flat and low enough that you don't have to think about it, and you don't have to know how big the file is before you query it.
+
+---
+
+## Update, 2026-10-07: polars 2.0, and two numbers above that were wrong
+
+Everything above this line is the post as first published, left as written. This section is what changed and what we got wrong, because a correction that quietly edits the original teaches nobody anything.
+
+Three things happened after publication. polars 2.0 shipped. We found that the benchmark above used polars' eager API when its lazy one is both recommended and faster. And chasing the gap that exposed turned up a correctness bug of our own.
+
+### The measurement above used the wrong polars API
+
+`pl.read_csv()` loads the file, then queries it. `pl.scan_csv()` builds a lazy plan and lets polars push work into the scan. For a file on disk the second is what polars tells you to use, and on these queries it is the faster of the two. The post above used the first one throughout.
+
+That mattered most on exactly the shape the post called "polars' strongest ground":
+
+```
+ORDER BY salary DESC LIMIT 10, 745.6 MB
+  polars 1.44.1 eager   1.504s
+  polars 1.44.1 lazy    1.094s
+  polars 2.0.0  eager   2.119s
+  polars 2.0.0  lazy    0.290s
+```
+
+polars 2.0's streaming engine is 3.8x faster than 1.44.1 on the lazy path and slower on the eager one, so which API you call now changes the answer by 7x. We had picked the slow one and reported the result as a 1.60x win.
+
+### So the top-N claim above is wrong
+
+The table above says `ORDER BY salary DESC LIMIT 10` was 1.48x and 1.60x in csvql's favour. Against `scan_csv` we were losing it, by about 6x at 20M rows. Not by a little, and not because of polars 2.0: polars 1.44.1's lazy path already beat us, 1.094s against our 1.794s, on the day we published.
+
+The cause was ours. `ORDER BY x LIMIT 10` had every worker append every row it saw, the merge copied all of them into sort keys, and only then did the top-K heap keep ten and discard twenty million. The right algorithm ran after the cost had already been paid. Each worker now keeps its own bounded heap of K, so the merge sorts threads*K entries instead of the whole file.
+
+That took the query from 2.06s to 0.38s. It did not produce a win:
+
+```
+20M rows / 711 MB, ORDER BY salary DESC LIMIT 10
+  csvql   0.344s
+  polars  0.305s
+  duckdb  0.420s
+```
+
+We are level with polars and 1.2x ahead of DuckDB. Closing a 6x deficit to a draw is the honest description.
+
+### And the flat-memory claim needs a boundary
+
+The post above says csvql "holds peak memory at about 75 MB from a 73 MB file to a 4 GB one". That is true of aggregates and false of sorts, which the post should have checked rather than reasoned about. On the same 711 MB file:
+
+```
+GROUP BY department              csvql    54 MB
+ORDER BY salary DESC LIMIT 10    csvql   715 MB
+GROUP BY department              polars 1110 MB
+```
+
+The flat line is real, and it is a property of aggregate queries, where csvql keeps only the running accumulator. `ORDER BY` has to hold rows, so it tracks the file. 715 MB is down from 1687 MB before the fix above, and what remains is memory-mapped file pages, which the kernel can evict, rather than the ~970 MB of anonymous allocation that used to sit beside them. But it is not 75 MB, and the original sentence should not have implied it was.
+
+### The full picture, including where we lose
+
+One query per process, so nothing is cached between calls, engines interleaved round by round, first round discarded because it pays for page cache. polars 2.0.0 through `scan_csv`. Median of five.
+
+20M rows, 711 MB:
+
+| shape | csvql | polars 2.0 | duckdb | vs polars | vs duckdb |
+|---|---|---|---|---|---|
+| `COUNT(*)` | 0.0256 | 0.0220 | 0.4005 | **0.86x** | 15.6x |
+| `SUM(salary)` | 0.0807 | 0.2268 | 0.3716 | 2.81x | 4.6x |
+| `GROUP BY department` | 0.1241 | 0.3173 | 0.4978 | 2.56x | 4.0x |
+| `WHERE city = 'Boston'` | 0.0804 | 0.2818 | 0.4351 | 3.51x | 5.4x |
+| `ORDER BY salary LIMIT 10` | 0.3440 | 0.3047 | 0.4197 | **0.89x** | 1.2x |
+| `LIMIT 10`, no sort | 0.0011 | 0.0029 | 0.0662 | 2.65x | 60.9x |
+
+2M rows, 69.2 MB:
+
+| shape | csvql | polars 2.0 | duckdb | vs polars | vs duckdb |
+|---|---|---|---|---|---|
+| `COUNT(*)` | 0.0039 | 0.0045 | 0.1064 | 1.15x | 27.1x |
+| `SUM(salary)` | 0.0125 | 0.0361 | 0.1132 | 2.88x | 9.0x |
+| `GROUP BY department` | 0.0140 | 0.0447 | 0.1159 | 3.19x | 8.3x |
+| `WHERE city = 'Boston'` | 0.0094 | 0.0331 | 0.1122 | 3.53x | 12.0x |
+| `ORDER BY salary LIMIT 10` | 0.0381 | 0.0412 | 0.1119 | 1.08x | 2.9x |
+| `LIMIT 10`, no sort | 0.0011 | 0.0031 | 0.0681 | 2.86x | 61.8x |
+
+The bold cells are losses. `COUNT(*)` at 711 MB is a loss we cannot do much about: counting records means reading every byte, CSV carries no row count to shortcut to, and at 0.0256s for 711 MB both engines are near 29 GB/s and bandwidth-bound rather than compute-bound. It was 3x worse before we stopped splitting every row into fields to increment a counter that never looked at them.
+
+### Where the gap is actually large
+
+Not on the narrow six-column file both of these tables use. On a wide one, which is what a CSV exported from a warehouse or a spreadsheet usually looks like:
+
+```
+757 MB, 60 columns, SUM of one column at position 58
+  csvql   0.0563s
+  polars  0.2187s    3.9x
+  duckdb  0.5767s   10.2x
+```
+
+csvql finds the fields it needs and skips the rest of each row. A reader that materialises columns pays for all sixty whether the query mentions them or not. That advantage grows with the columns you are not asking about, and it is the one number here worth leading with.
+
+### Reproducing
+
+```sh
+./bench/gen_fixture.sh fixture.csv 20000000
+./bench/bench_vs_polars.sh fixture.csv 6
+```
+
+csvql 2.8.1 plus the `COUNT(*)` change, polars 2.0.0, duckdb 1.5.6 (Python package; the CLI used for differential testing is 1.5.5), Python 3.14.4, Apple M2 Pro, 12 cores, 16 GB, macOS 26.5.1.
+
+One note on provenance, since it affects the numbers in the original post above. `python/csvql/_loader.py` prefers a bundled `python/csvql/libcsvql.dylib` over the one in `zig-out/lib`. The copy on the machine that produced the first set of figures was five days stale, which we only noticed when the Python binding reported 1.5s for a query the CLI finished in 0.35s. No engine change landed in those five days, so the original numbers are probably sound, but they were not verified against the code they claimed to measure. Every figure in this update was taken with that file freshly copied.
