@@ -608,8 +608,16 @@ fn executeFileBased(allocator: Allocator, query: parser.Query, output_file: std.
     // Check file size for processing strategy
     const file_stat = try file.stat();
 
+    // Neither mmap path resolves ORDER BY secondary keys — they sort on the
+    // primary column only, which silently returns the wrong row order for
+    // `ORDER BY a, b` on any file over the 5 MB threshold (#223). Only
+    // executeSequential builds a MultiKeyCtx, so multi-key sorts go there
+    // until the fast paths learn to do it. Correct and slow beats fast and
+    // wrong.
+    const multi_key_order = if (query.order_by) |ob| ob.secondary.len > 0 else false;
+
     // Use parallel memory-mapped I/O for large files (2+ cores, no LIMIT unless ORDER BY)
-    if (query.offset == 0 and file_stat.size > 10 * 1024 * 1024 and (query.limit < 0 or query.limit > 100000 or query.order_by != null)) {
+    if (!multi_key_order and query.offset == 0 and file_stat.size > 10 * 1024 * 1024 and (query.limit < 0 or query.limit > 100000 or query.order_by != null)) {
         const num_threads = options_mod.effectiveThreadCount(opts);
         if (num_threads > 1) {
             try parallel_mmap.executeParallelMapped(allocator, query, file, output_file, opts);
@@ -618,7 +626,7 @@ fn executeFileBased(allocator: Allocator, query: parser.Query, output_file: std.
     }
 
     // Use memory-mapped I/O for medium-large files
-    if (query.offset == 0 and file_stat.size > 5 * 1024 * 1024) {
+    if (!multi_key_order and query.offset == 0 and file_stat.size > 5 * 1024 * 1024) {
         try mmap_engine.executeMapped(allocator, query, file, output_file, opts);
         return;
     }

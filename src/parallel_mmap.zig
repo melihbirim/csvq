@@ -95,6 +95,13 @@ const SortWorkerContext = struct {
     where_column_idx: ?usize,
     order_by_col_idx: usize, // column index in the raw CSV (not output)
     result: std.ArrayList(SortLine),
+    /// Bounded top-K heap, used instead of `result` when the query has a
+    /// LIMIT. Without it each worker appends every row it sees, so
+    /// `ORDER BY x LIMIT 10` over 20M rows built 20M SortLine entries and
+    /// then copied them into 20M SortKeys only for fast_sort to throw all
+    /// but 10 away (#224). The heap keeps K per worker instead, so the
+    /// merge sorts threads*K entries rather than the whole file.
+    topk: ?fast_sort.TopKHeap = null,
     allocator: Allocator,
     delimiter: u8,
     strict: bool,
@@ -280,6 +287,14 @@ pub fn executeParallelMapped(
         var sort_contexts = try allocator.alloc(SortWorkerContext, num_threads);
         defer allocator.free(sort_contexts);
 
+        // ORDER BY ... LIMIT K only ever needs K rows per worker. DISTINCT is
+        // excluded because dedup happens after the sort, so a row dropped here
+        // could be the one that survives dedup there.
+        const topk_k: ?usize = if (query.limit >= 0 and !query.distinct)
+            @as(usize, @intCast(query.offset)) + @as(usize, @intCast(query.limit))
+        else
+            null;
+
         for (0..num_threads) |i| {
             sort_contexts[i] = SortWorkerContext{
                 .data = data,
@@ -292,6 +307,10 @@ pub fn executeParallelMapped(
                 .allocator = allocator,
                 .delimiter = opts.delimiter,
                 .strict = opts.strict,
+                .topk = if (topk_k) |k|
+                    try fast_sort.TopKHeap.init(allocator, k, order_by.order == .desc)
+                else
+                    null,
             };
             threads[i] = try std.Thread.spawn(.{}, sortWorkerThread, .{&sort_contexts[i]});
         }
@@ -308,22 +327,33 @@ pub fn executeParallelMapped(
 
         // Merge all sort entries and convert to fast_sort.SortKey
         var total_entries: usize = 0;
-        for (sort_contexts) |ctx| total_entries += ctx.result.items.len;
+        for (sort_contexts) |ctx| {
+            total_entries += if (ctx.topk) |h| h.len else ctx.result.items.len;
+        }
 
         var all_entries = try allocator.alloc(fast_sort.SortKey, total_entries);
         defer allocator.free(all_entries);
 
         var offset: usize = 0;
         for (sort_contexts) |*ctx| {
-            for (ctx.result.items) |entry| {
-                all_entries[offset] = fast_sort.makeSortKey(
-                    entry.numeric_key,
-                    entry.sort_key,
-                    entry.line,
-                );
-                offset += 1;
+            if (ctx.topk) |*heap| {
+                // Heap order is not sorted order; the global sort below fixes
+                // that. Only membership matters here.
+                @memcpy(all_entries[offset..][0..heap.len], heap.items[0..heap.len]);
+                offset += heap.len;
+                heap.deinit();
+                ctx.topk = null;
+            } else {
+                for (ctx.result.items) |entry| {
+                    all_entries[offset] = fast_sort.makeSortKey(
+                        entry.numeric_key,
+                        entry.sort_key,
+                        entry.line,
+                    );
+                    offset += 1;
+                }
+                ctx.result.deinit(allocator);
             }
-            ctx.result.deinit(allocator);
         }
 
         // Sort using hardware-aware strategy (radix/heap/comparison)
@@ -636,11 +666,17 @@ fn processSortChunk(ctx: *SortWorkerContext) !void {
             else
                 raw_sort_key;
             const numeric_key = std.fmt.parseFloat(f64, sort_key) catch std.math.nan(f64);
-            try ctx.result.append(ctx.allocator, SortLine{
-                .numeric_key = numeric_key,
-                .sort_key = sort_key,
-                .line = line,
-            });
+            if (ctx.topk) |*heap| {
+                // Same comparator the global heap_topk strategy uses, so
+                // pushing the limit down selects the same rows it would.
+                heap.insert(fast_sort.makeSortKey(numeric_key, sort_key, line));
+            } else {
+                try ctx.result.append(ctx.allocator, SortLine{
+                    .numeric_key = numeric_key,
+                    .sort_key = sort_key,
+                    .line = line,
+                });
+            }
         }
 
         line_start += line_end + 1;
