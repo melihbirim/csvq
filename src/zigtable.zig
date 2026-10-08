@@ -259,6 +259,10 @@ pub const Table = struct {
                 if (natural[i] > max) natural[i] = max;
             }
         }
+        // A Markdown separator cell needs at least three characters (":--").
+        if (self.border_style == .markdown) {
+            for (natural) |*w| w.* = @max(w.*, 3);
+        }
 
         if (self.terminal_width) |term_w| {
             // Per-column overhead: left-border(1) + padding + content + padding.
@@ -376,21 +380,14 @@ pub const Table = struct {
 
             const real_count = if (self.num_visible_cols > 0) self.num_visible_cols else self.columns.len;
             const alignment: Alignment = if (i < real_count) self.columns[i].alignment else .left;
-            if (alignment == .center or alignment == .left) {
-                _ = try writer.write(":");
-            } else {
+            const leading_colon = alignment == .center or alignment == .left;
+            const trailing_colon = alignment == .center or alignment == .right;
+            const dashes = width - @as(usize, @intFromBool(leading_colon)) - @as(usize, @intFromBool(trailing_colon));
+            if (leading_colon) _ = try writer.write(":");
+            for (0..dashes) |_| {
                 _ = try writer.write("-");
             }
-
-            for (1..width) |_| {
-                _ = try writer.write("-");
-            }
-
-            if (alignment == .center or alignment == .right) {
-                _ = try writer.write(":");
-            } else {
-                _ = try writer.write("-");
-            }
+            if (trailing_colon) _ = try writer.write(":");
 
             for (0..self.padding) |_| {
                 _ = try writer.write(" ");
@@ -681,4 +678,31 @@ test "proportional terminal fit" {
         // Count display columns (ASCII border lines are 1 byte = 1 col).
         try std.testing.expect(displayLen(line) <= 60);
     }
+}
+
+test "markdown separator matches cell width and honors alignment" {
+    const allocator = std.testing.allocator;
+
+    const columns = [_]Column{
+        .{ .name = "Left", .alignment = .left },
+        .{ .name = "Center", .alignment = .center },
+        .{ .name = "Right", .alignment = .right },
+        .{ .name = "" },
+    };
+
+    var table = Table.init(allocator, &columns);
+    defer table.deinit();
+    table.border_style = .markdown;
+    try table.addRow(&[_][]const u8{ "A", "B", "C", "D" });
+
+    var buffer = std.ArrayList(u8){};
+    defer buffer.deinit(allocator);
+    try table.render(buffer.writer(allocator));
+
+    try std.testing.expectEqualStrings(
+        "| Left | Center | Right |     |\n" ++
+            "| :--- | :----: | ----: | :-- |\n" ++
+            "| A    |   B    |     C | D   |\n",
+        buffer.items,
+    );
 }
