@@ -4,7 +4,7 @@
 # Four files carry it. release.yml rewrites nodejs/package.json and
 # python/pyproject.toml from the git tag, but neither Zig source, so those two
 # only stayed in step if someone remembered to run release.sh. src/mcp.zig
-# reported "1.0.1" in its MCP serverInfo handshake for roughly sixteen releases
+# reported "1.0.1" in its MCP serverInfo handshake for forty-seven releases
 # because nothing in the codebase reads that field.
 #
 # With an argument, also asserts the version matches it, so a release workflow

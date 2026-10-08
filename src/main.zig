@@ -894,7 +894,7 @@ test "the version string agrees with src/mcp.zig" {
     // and python/pyproject.toml. release.yml rewrites the latter two from the
     // git tag but neither Zig source, so these two are the drift-prone pair and
     // the only ones @embedFile can reach from inside the package. src/mcp.zig
-    // reported 1.0.1 to every MCP client for roughly sixteen releases because
+    // reported 1.0.1 to every MCP client for forty-seven releases because
     // nothing reads that field and so nothing noticed. All four are checked by
     // scripts/check_versions.sh in CI.
     const mcp_src = @embedFile("mcp.zig");
