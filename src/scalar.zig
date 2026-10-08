@@ -2,7 +2,8 @@
 ///
 /// Supports: UPPER, LOWER, TRIM, REVERSE, LENGTH, SUBSTR/SUBSTRING,
 ///           ABS, SIGN, CEIL, FLOOR, MOD, COALESCE, CAST(col AS type), REPLACE,
-///           SPLIT_PART, GREATEST, LEAST, LPAD, RPAD
+///           SPLIT_PART, GREATEST, LEAST, LPAD, RPAD, SQRT, POWER/POW, LN, LOG,
+///           EXP, TRUNC
 ///
 /// Usage:
 ///   1. Call tryParseScalar(expr, column_map, allocator) at query setup time to
@@ -33,6 +34,7 @@ pub const ScalarSpec = union(enum) {
     ceil: usize, // CEIL(col)
     floor: usize, // FLOOR(col)
     mod_op: ModArgs, // MOD(col, divisor)
+    math: MathArgs, // SQRT, POWER/POW, LN, LOG, EXP, TRUNC
     coalesce: CoalesceArgs, // COALESCE(col, fallback_literal)
     cast_int: usize, // CAST(col AS INTEGER/BIGINT)
     cast_float: usize, // CAST(col AS FLOAT/REAL/NUMERIC/DECIMAL)
@@ -78,6 +80,34 @@ pub const ScalarSpec = union(enum) {
     pub const ModArgs = struct {
         col_idx: usize,
         divisor: f64,
+    };
+
+    /// The floating-point math functions. A result that is NaN or infinite
+    /// (SQRT of a negative, LN/LOG of zero or a negative, an overflowing
+    /// EXP/POWER) is NULL, so it is written as an empty field.
+    pub const MathArgs = struct {
+        pub const Func = enum { sqrt, power, ln, log, exp, trunc };
+
+        col_idx: usize,
+        func: Func,
+        /// POWER: the exponent. LOG: the base (10 for the one-argument form).
+        param: f64 = 0,
+
+        pub fn apply(self: MathArgs, x: f64) f64 {
+            return switch (self.func) {
+                .sqrt => @sqrt(x),
+                .power => std.math.pow(f64, x, self.param),
+                .ln => @log(x),
+                .log => if (self.param == 10)
+                    @log10(x)
+                else if (self.param == 2)
+                    @log2(x)
+                else
+                    @log(x) / @log(self.param),
+                .exp => @exp(x),
+                .trunc => @trunc(x),
+            };
+        }
     };
 
     /// Inline fixed-size buffer — no heap allocation. Supports up to 8 column args.
@@ -183,6 +213,7 @@ pub const ScalarSpec = union(enum) {
             .substr => |a| a.col_idx,
             .lpad, .rpad => |a| a.col_idx,
             .mod_op => |a| a.col_idx,
+            .math => |a| a.col_idx,
             .coalesce => |a| a.cols()[0],
             .datediff => |a| a.start_col, // return first column
             .dateadd => |a| a.date_col,
@@ -506,6 +537,41 @@ pub fn tryParseScalar(
         const divisor = std.fmt.parseFloat(f64, div_str) catch return null;
 
         return .{ .mod_op = .{ .col_idx = cidx, .divisor = divisor } };
+    }
+
+    // ── SQRT / LN / EXP / TRUNC / LOG / POWER ──────────────────────────────
+    if (parseMathFunc(fn_lower)) |func| {
+        switch (func) {
+            .sqrt, .ln, .exp, .trunc => {
+                const cidx = try resolveCol(args_str, column_map, allocator) orelse
+                    return error.ColumnNotFound;
+                return .{ .math = .{ .col_idx = cidx, .func = func } };
+            },
+            .log => {
+                // LOG(x) is base 10; LOG(base, x) takes a numeric literal base.
+                const comma = std.mem.indexOfScalar(u8, args_str, ',') orelse {
+                    const cidx = try resolveCol(args_str, column_map, allocator) orelse
+                        return error.ColumnNotFound;
+                    return .{ .math = .{ .col_idx = cidx, .func = .log, .param = 10 } };
+                };
+                const base_str = std.mem.trim(u8, args_str[0..comma], &std.ascii.whitespace);
+                const col_str = std.mem.trim(u8, args_str[comma + 1 ..], &std.ascii.whitespace);
+                const base = std.fmt.parseFloat(f64, base_str) catch return null;
+                if (!(base > 0) or base == 1 or !std.math.isFinite(base)) return error.InvalidQuery;
+                const cidx = try resolveCol(col_str, column_map, allocator) orelse
+                    return error.ColumnNotFound;
+                return .{ .math = .{ .col_idx = cidx, .func = .log, .param = base } };
+            },
+            .power => {
+                const comma = std.mem.indexOfScalar(u8, args_str, ',') orelse return null;
+                const col_str = std.mem.trim(u8, args_str[0..comma], &std.ascii.whitespace);
+                const exp_str = std.mem.trim(u8, args_str[comma + 1 ..], &std.ascii.whitespace);
+                const cidx = try resolveCol(col_str, column_map, allocator) orelse
+                    return error.ColumnNotFound;
+                const exponent = std.fmt.parseFloat(f64, exp_str) catch return null;
+                return .{ .math = .{ .col_idx = cidx, .func = .power, .param = exponent } };
+            },
+        }
     }
 
     // ── ROUND ──────────────────────────────────────────────────────────────
@@ -933,6 +999,12 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
             const buf = arena.alloc(u8, 32) catch return v;
             return fmtNum(buf, @mod(n, args.divisor));
         },
+        .math => |args| {
+            const v = field(record, args.col_idx);
+            const n = std.fmt.parseFloat(f64, v) catch return v;
+            const buf = arena.alloc(u8, 32) catch return v;
+            return fmtMath(buf, args.apply(n));
+        },
         .coalesce => |args| {
             for (args.cols()) |cidx| {
                 const v = field(record, cidx);
@@ -1212,6 +1284,26 @@ pub fn fmtFloat(buf: []u8, n: f64) []const u8 {
         return std.fmt.bufPrint(buf, "{d}.0", .{@as(i64, @intFromFloat(n))}) catch buf[0..0];
     }
     return std.fmt.bufPrint(buf, "{d}", .{n}) catch buf[0..0];
+}
+
+/// Format a math function result. NaN and infinity become an empty field
+/// (NULL). A magnitude too long for `buf` in plain decimal falls back to
+/// scientific notation instead of being silently dropped.
+fn fmtMath(buf: []u8, n: f64) []const u8 {
+    if (!std.math.isFinite(n)) return "";
+    const plain = fmtFloat(buf, n);
+    if (plain.len > 0) return plain;
+    return std.fmt.bufPrint(buf, "{e}", .{n}) catch "";
+}
+
+fn parseMathFunc(name: []const u8) ?ScalarSpec.MathArgs.Func {
+    if (std.mem.eql(u8, name, "sqrt")) return .sqrt;
+    if (std.mem.eql(u8, name, "power") or std.mem.eql(u8, name, "pow")) return .power;
+    if (std.mem.eql(u8, name, "ln")) return .ln;
+    if (std.mem.eql(u8, name, "log")) return .log;
+    if (std.mem.eql(u8, name, "exp")) return .exp;
+    if (std.mem.eql(u8, name, "trunc")) return .trunc;
+    return null;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1539,6 +1631,134 @@ test "LPAD/RPAD: an explicit empty pad string is a no-op when padding is needed"
     fba.reset();
     // truncation needs no pad character, so it still applies
     try std.testing.expectEqualStrings("eleph", eval(lp, &.{"elephant"}, fba.allocator()));
+}
+
+fn expectMath(expr: []const u8, input: []const u8, expected: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("v", 0);
+    const spec = (try tryParseScalar(expr, cm, allocator)).?;
+    try std.testing.expectEqualStrings(expected, eval(spec, &.{input}, allocator));
+}
+
+test "SQRT: results are doubles, a negative input is NULL" {
+    try expectMath("SQRT(v)", "16", "4.0");
+    try expectMath("SQRT(v)", "2", "1.4142135623730951");
+    try expectMath("SQRT(v)", "0", "0.0");
+    try expectMath("sqrt(v)", "2.25", "1.5");
+    try expectMath("SQRT(v)", "-4", "");
+}
+
+test "POWER/POW: literal exponent, NaN and overflow are NULL" {
+    try expectMath("POWER(v, 2)", "3", "9.0");
+    try expectMath("POW(v, 2)", "1.5", "2.25");
+    try expectMath("POWER(v, 0.5)", "16", "4.0");
+    try expectMath("POWER(v, -1)", "4", "0.25");
+    try expectMath("POWER(v, 0)", "7", "1.0");
+    try expectMath("POWER(v, -1)", "0", "");
+    try expectMath("POWER(v, 0.5)", "-4", "");
+    try expectMath("POWER(v, 1000)", "10", "");
+    try expectMath("POWER(v, 3)", "-2", "-8.0");
+}
+
+test "LN: zero and negative inputs are NULL" {
+    try expectMath("LN(v)", "1", "0.0");
+    try expectMath("LN(v)", "2.718281828459045", "1.0");
+    try expectMath("LN(v)", "0", "");
+    try expectMath("LN(v)", "-1", "");
+}
+
+test "LOG: base 10 by default, optional literal base first" {
+    try expectMath("LOG(v)", "1000", "3.0");
+    try expectMath("LOG(v)", "0.01", "-2.0");
+    try expectMath("LOG(v)", "0", "");
+    try expectMath("LOG(v)", "-5", "");
+    try expectMath("LOG(2, v)", "8", "3.0");
+    try expectMath("LOG(3, v)", "81", "4.0");
+    try expectMath("LOG(2.5, v)", "0", "");
+    try expectMath("LOG(2, v)", "-8", "");
+}
+
+test "LOG: a base that is not positive or is 1 is rejected at parse time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("v", 0);
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("LOG(1, v)", cm, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("LOG(0, v)", cm, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("LOG(-2, v)", cm, allocator));
+}
+
+test "EXP: overflow is NULL, underflow to zero is kept" {
+    try expectMath("EXP(v)", "0", "1.0");
+    try expectMath("EXP(v)", "1", "2.718281828459045");
+    try expectMath("EXP(v)", "1000", "");
+    try expectMath("EXP(v)", "-1000", "0.0");
+}
+
+test "TRUNC: rounds toward zero, unlike FLOOR and CEIL" {
+    try expectMath("TRUNC(v)", "-2.7", "-2.0");
+    try expectMath("TRUNC(v)", "2.7", "2.0");
+    try expectMath("TRUNC(v)", "-0.5", "0.0");
+    try expectMath("TRUNC(v)", "5", "5.0");
+    try expectMath("FLOOR(v)", "-2.7", "-3.0");
+    try expectMath("CEIL(v)", "-2.7", "-2.0");
+}
+
+test "math functions: empty stays NULL, non-numeric text passes through" {
+    const exprs = [_][]const u8{ "SQRT(v)", "POWER(v, 2)", "LN(v)", "LOG(v)", "LOG(2, v)", "EXP(v)", "TRUNC(v)" };
+    for (exprs) |expr| {
+        try expectMath(expr, "", "");
+        try expectMath(expr, "abc", "abc");
+    }
+}
+
+test "math functions: non-finite input text gives NULL" {
+    try expectMath("SQRT(v)", "inf", "");
+    try expectMath("TRUNC(v)", "nan", "");
+}
+
+test "math functions: huge and tiny results are not dropped" {
+    try expectMath("POWER(v, 20)", "10", "100000000000000000000");
+
+    // Too long for the 32-byte buffer in plain decimal, so scientific notation.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("v", 0);
+    const big = (try tryParseScalar("POWER(v, 300)", cm, allocator)).?;
+    const big_out = eval(big, &.{"10"}, allocator);
+    try std.testing.expect(std.mem.indexOfScalar(u8, big_out, 'e') != null);
+    try std.testing.expectApproxEqRel(@as(f64, 1e300), try std.fmt.parseFloat(f64, big_out), 1e-9);
+    const tiny = (try tryParseScalar("EXP(v)", cm, allocator)).?;
+    const tiny_out = eval(tiny, &.{"-700"}, allocator);
+    try std.testing.expect(std.mem.indexOfScalar(u8, tiny_out, 'e') != null);
+    try std.testing.expectApproxEqRel(@as(f64, 9.85967654375977e-305), try std.fmt.parseFloat(f64, tiny_out), 1e-9);
+}
+
+test "math functions: wrong argument shapes are rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("v", 0);
+    try cm.put("w", 1);
+    const one_arg = [_][]const u8{ "SQRT", "LN", "EXP", "TRUNC", "LOG" };
+    for (one_arg) |name| {
+        const two = try std.fmt.allocPrint(allocator, "{s}(v, w, v)", .{name});
+        try std.testing.expect((tryParseScalar(two, cm, allocator) catch null) == null);
+        const none = try std.fmt.allocPrint(allocator, "{s}()", .{name});
+        try std.testing.expectError(error.ColumnNotFound, tryParseScalar(none, cm, allocator));
+    }
+    try std.testing.expectError(error.ColumnNotFound, tryParseScalar("SQRT(v, w)", cm, allocator));
+    try std.testing.expect((try tryParseScalar("POWER(v)", cm, allocator)) == null);
+    try std.testing.expect((try tryParseScalar("POWER(v, w)", cm, allocator)) == null);
+    try std.testing.expect((try tryParseScalar("POWER(v, 2, 3)", cm, allocator)) == null);
+    try std.testing.expectError(error.ColumnNotFound, tryParseScalar("SQRT(nosuch)", cm, allocator));
 }
 
 test "GREATEST/LEAST: numeric and lexicographic" {

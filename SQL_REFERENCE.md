@@ -45,6 +45,7 @@ Full syntax reference and runnable examples for every SQL feature csvql supports
 | **GREATEST / LEAST** | `SELECT GREATEST(a, b, ...)`, `LEAST(a, b, ...)` — row-wise max/min (numeric or lexicographic) |
 | **ABS / SIGN / CEIL / FLOOR** | `SELECT ABS(col), SIGN(col), CEIL(col), FLOOR(col)` — numeric functions; `SIGN` returns `-1`, `0`, or `1` |
 | **MOD**       | `SELECT MOD(col, n)` — modulo by a numeric literal                      |
+| **SQRT / POWER / LN / LOG / EXP / TRUNC** | `SELECT SQRT(col)`, `POWER(col, n)` (alias `POW`), `LN(col)`, `LOG(col)` (base 10), `LOG(base, col)`, `EXP(col)`, `TRUNC(col)` (toward zero, so `TRUNC(-2.7)` is `-2.0`). `n` and `base` are numeric literals. Results are doubles and print with a decimal point, like `CEIL`/`FLOOR`. A result that is not a finite number (`SQRT` of a negative, `LN`/`LOG` of zero or a negative, an overflowing `EXP`/`POWER`) is NULL and written as an empty field, where DuckDB raises an error. An empty field stays empty and non-numeric text is returned unchanged. A `LOG` base that is not positive or is `1` is a query error |
 | **ROUND**     | `SELECT ROUND(col)` — round to integer; `ROUND(col, n)` — round to `n` decimal places |
 | **COALESCE**  | `SELECT COALESCE(col, 'default')` — replace empty/null with fallback    |
 | **CAST**      | `SELECT CAST(col AS INTEGER/FLOAT/TEXT)` — type conversion              |
@@ -113,6 +114,7 @@ csvql "SELECT name, LENGTH(name), SUBSTR(name, 1, 3) FROM 'data.csv'"
 # Numeric functions
 csvql "SELECT name, ABS(balance), SIGN(balance), CEIL(score), FLOOR(score) FROM 'data.csv'"
 csvql "SELECT name, MOD(age, 10) AS age_decade FROM 'data.csv'"
+csvql "SELECT SQRT(area), POWER(side, 2), LN(price), LOG(2, size), TRUNC(delta) FROM 'data.csv'"
 csvql "SELECT name, ROUND(price) AS rounded, ROUND(price, 2) AS price_2dp FROM 'data.csv'"
 
 # COALESCE — replace empty values with a fallback
