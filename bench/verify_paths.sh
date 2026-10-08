@@ -15,12 +15,16 @@
 # mmap path resolved the secondary keys and no test ever crossed the threshold.
 #
 # This runs verify_correctness.sh once per path, on a fixture sized to land in
-# it, and then does the check the per-path runs cannot do on their own: the
-# same queries over the *same* bytes with --threads 1 and with the default,
-# which is mmap_engine against parallel_mmap on identical input. Agreeing with
-# DuckDB separately is weaker than agreeing with each other, because two paths
-# can both be wrong in the same way and still match the oracle on a query
-# shape the oracle normalises.
+# it, plus once more over the 12 MB fixture with --threads 1, which drops that
+# file from parallel_mmap to mmap_engine and so compares two paths over the
+# same bytes. Agreeing with DuckDB separately is weaker than agreeing with each
+# other, because two paths can both be wrong in the same way and still match
+# the oracle on a query shape the oracle normalises.
+#
+# The four batteries run concurrently: ~42s wall instead of ~99s serial, which
+# is the slowest battery rather than the sum. They are separate processes with
+# their own temp dirs, and nothing here measures time, so CPU contention is
+# harmless.
 #
 # Usage:
 #   ./bench/verify_paths.sh
@@ -64,31 +68,26 @@ echo ""
 
 FAILED=0
 
+# Each battery is a separate process with its own mktemp dir and reads nothing
+# the others write, so they run concurrently. These are correctness checks, not
+# timings, so contending for CPU costs nothing that matters, and wall time
+# becomes the slowest battery rather than the sum of all of them.
+declare -a PIDS=()
+declare -a LABELS=()
+
 for i in "${!NAMES[@]}"; do
   name="${NAMES[$i]}"
   rows="${ROWS[$i]}"
   csv="$WORK/path_${name}.csv"
   "$SCRIPT_DIR/gen_fixture.sh" "$csv" "$rows" >/dev/null
   mb=$(awk -v b="$(wc -c < "$csv")" 'BEGIN{printf "%.1f", b/1048576}')
-
-  echo -e "${BOLD}── ${name} path (${mb} MB, ${rows} rows)${RESET}"
-  if "$SCRIPT_DIR/verify_correctness.sh" "$csv" > "$WORK/out_${name}.txt" 2>&1; then
-    tail -4 "$WORK/out_${name}.txt" | grep -E "Total|Pass|All" || true
-  else
-    FAILED=1
-    echo -e "  ${RED}FAILED on the ${name} path${RESET}"
-    # Only the failing checks matter here; the full log is long.
-    grep -E "FAIL" "$WORK/out_${name}.txt" | head -20
-  fi
-  echo ""
+  LABELS+=("${name} path (${mb} MB, ${rows} rows)")
+  "$SCRIPT_DIR/verify_correctness.sh" "$csv" > "$WORK/out_${name}.txt" 2>&1 &
+  PIDS+=("$!")
 done
 
-# ── same bytes, two paths ────────────────────────────────────────
-# --threads 1 fails the "2+ threads" condition, so a file over 10 MB takes
-# mmap_engine instead of parallel_mmap. Running the battery both ways over one
-# fixture compares those two paths directly.
-echo -e "${BOLD}── mmap vs parallel on identical input${RESET}"
-
+# --threads 1 fails the "2+ threads" condition, so the 12 MB fixture drops from
+# parallel_mmap to mmap_engine. Same bytes, different path.
 SHIM="$WORK/csvql_t1"
 cat > "$SHIM" <<SH
 #!/usr/bin/env bash
@@ -97,13 +96,23 @@ SH
 chmod +x "$SHIM"
 
 big="$WORK/path_parallel.csv"
-if CSVQL_BIN="$SHIM" "$SCRIPT_DIR/verify_correctness.sh" "$big" > "$WORK/out_threads1.txt" 2>&1; then
-  tail -4 "$WORK/out_threads1.txt" | grep -E "Total|Pass|All" || true
-else
-  FAILED=1
-  echo -e "  ${RED}FAILED with --threads 1 on a 12 MB file${RESET}"
-  grep -E "FAIL" "$WORK/out_threads1.txt" | head -20
-fi
+LABELS+=("mmap_engine over the 12 MB fixture (--threads 1)")
+NAMES+=("threads1")
+CSVQL_BIN="$SHIM" "$SCRIPT_DIR/verify_correctness.sh" "$big" > "$WORK/out_threads1.txt" 2>&1 &
+PIDS+=("$!")
+
+for i in "${!PIDS[@]}"; do
+  if wait "${PIDS[$i]}"; then
+    echo -e "${BOLD}── ${LABELS[$i]}${RESET}"
+    tail -4 "$WORK/out_${NAMES[$i]}.txt" | grep -E "Total|Pass|All" || true
+  else
+    FAILED=1
+    echo -e "${BOLD}── ${LABELS[$i]}${RESET}"
+    echo -e "  ${RED}FAILED${RESET}"
+    grep -E "FAIL" "$WORK/out_${NAMES[$i]}.txt" | head -20
+  fi
+  echo ""
+done
 
 # A query battery that agrees with DuckDB on both paths can still differ
 # between them in row order, which matters for ORDER BY and LIMIT. Compare the
