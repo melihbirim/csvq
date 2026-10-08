@@ -595,11 +595,25 @@ fn processSortChunk(ctx: *SortWorkerContext) !void {
             // (issue #107) — field_buf itself stays raw so the sort-key
             // extraction below can unescape independently into a persistent
             // allocator instead of this per-row-reset one.
-            _ = unescape_arena.reset(.retain_capacity);
-            var eval_buf: [256][]const u8 = field_buf;
-            for (eval_buf[0..field_count]) |*f| {
-                if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
-                    f.* = unescapeQuotesAlloc(unescape_arena.allocator(), f.*) catch f.*;
+            //
+            // `var eval_buf: [256][]const u8 = field_buf` copies the whole
+            // fixed-size array, which is 256 slices and so 4 KB per row no
+            // matter how many fields the row has, and it ran even when the
+            // query had no WHERE for it to feed. That was the cost of
+            // ORDER BY: 0.33s on a 20M-row file where SUM over the same
+            // column took 0.08s, and it scaled with row count rather than
+            // field count, which is how a per-row fixed-size copy behaves.
+            // Nothing below reads eval_buf unless where_expr is non-null.
+            var eval_storage: [256][]const u8 = undefined;
+            var eval_buf: [][]const u8 = field_buf[0..field_count];
+            if (ctx.query.where_expr != null) {
+                _ = unescape_arena.reset(.retain_capacity);
+                @memcpy(eval_storage[0..field_count], field_buf[0..field_count]);
+                eval_buf = eval_storage[0..field_count];
+                for (eval_buf) |*f| {
+                    if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
+                        f.* = unescapeQuotesAlloc(unescape_arena.allocator(), f.*) catch f.*;
+                    }
                 }
             }
 
@@ -643,14 +657,14 @@ fn processSortChunk(ctx: *SortWorkerContext) !void {
                         }
                     } else {
                         // Column not found via precomputed index: fall back to direct eval
-                        if (!parser.evaluateDirect(expr, eval_buf[0..field_count], ctx.lower_header)) {
+                        if (!parser.evaluateDirect(expr, eval_buf, ctx.lower_header)) {
                             line_start += line_end + 1;
                             continue;
                         }
                     }
                 } else {
                     // Complex expression (AND/OR/NOT): evaluate directly
-                    if (!parser.evaluateDirect(expr, eval_buf[0..field_count], ctx.lower_header)) {
+                    if (!parser.evaluateDirect(expr, eval_buf, ctx.lower_header)) {
                         line_start += line_end + 1;
                         continue;
                     }
