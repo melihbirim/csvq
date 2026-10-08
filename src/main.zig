@@ -809,6 +809,22 @@ fn parseDelimiter(arg: []const u8) u8 {
     return arg[0];
 }
 
+test "the version string agrees with src/mcp.zig" {
+    // Four files carry the version: this one, src/mcp.zig, nodejs/package.json
+    // and python/pyproject.toml. release.yml rewrites the latter two from the
+    // git tag but neither Zig source, so these two are the drift-prone pair and
+    // the only ones @embedFile can reach from inside the package. src/mcp.zig
+    // reported 1.0.1 to every MCP client for roughly sixteen releases because
+    // nothing reads that field and so nothing noticed. All four are checked by
+    // scripts/check_versions.sh in CI.
+    const mcp_src = @embedFile("mcp.zig");
+    const needle = "\\\"version\\\":\\\"";
+    const at = std.mem.indexOf(u8, mcp_src, needle) orelse return error.VersionNotFoundInMcp;
+    const rest = mcp_src[at + needle.len ..];
+    const end = std.mem.indexOf(u8, rest, "\\") orelse return error.VersionNotFoundInMcp;
+    try std.testing.expectEqualStrings(version, rest[0..end]);
+}
+
 test "exitCodeForError classifies bad-query, strict-mode, and uncategorized errors distinctly" {
     // Bad query / unresolved reference — the user's SQL is wrong.
     try std.testing.expectEqual(@as(u8, 2), exitCodeForError(error.ColumnNotFound));

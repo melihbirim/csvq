@@ -49,6 +49,12 @@ jobs:
         with:
           version: 0.15.2
 
+      # The tag drives what gets published, but src/main.zig and src/mcp.zig
+      # are not rewritten from it, so a tag pushed without bumping them ships
+      # binaries that report the previous version. Fail the release instead.
+      - name: Check the tag matches the versions in the tree
+        run: ./scripts/check_versions.sh "${{ github.ref_name }}"
+
       - name: Build release binary
         run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.zig-target }}
 

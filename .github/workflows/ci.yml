@@ -100,6 +100,13 @@ jobs:
     - name: Check formatting
       run: zig fmt --check src/ tests/ build.zig
 
+    # src/main.zig, src/mcp.zig, nodejs/package.json and python/pyproject.toml
+    # all carry the version, and release.yml only rewrites the last two from
+    # the tag. src/mcp.zig told every MCP client it was 1.0.1 for roughly
+    # sixteen releases. Costs nothing to check here.
+    - name: Check version strings agree
+      run: ./scripts/check_versions.sh
+
   correctness:
     name: Correctness vs DuckDB
     strategy:
@@ -158,6 +165,18 @@ jobs:
 
     - name: Run correctness suite (treats DuckDB as oracle)
       run: ./bench/verify_correctness.sh
+
+    # The step above runs on the default fixture, which is 0.65 MB, and
+    # engine.zig dispatches on size: under 5 MB sequential, over 5 MB
+    # mmap_engine, over 10 MB with 2+ threads parallel_mmap. So every query
+    # above takes one of three paths and the other two were never executed in
+    # CI at all. #223 shipped for roughly sixteen releases that way: the same
+    # battery already contained multi-key ORDER BY queries that would have
+    # caught it, but never on a file big enough to reach the broken code.
+    # This re-runs the battery once per path and diffs the paths against each
+    # other on identical bytes.
+    - name: Run correctness suite on every execution path
+      run: ./bench/verify_paths.sh
 
     # Differential query generator (#141) — fixed seed, smoke scale (300
     # queries, ~15s). Purpose here is catching a regression before merge,

@@ -14,13 +14,16 @@
 #
 # Environment overrides:
 #   DUCKDB_BIN   — path to duckdb binary  (default: duckdb in PATH)
+#   CSVQL_BIN    — path to the csvql binary, or a wrapper around it
+#                  (default: zig-out/bin/csvql). verify_paths.sh uses this to
+#                  run the same battery with --threads pinned.
 #
 # Exit code: 0 = all pass,  1 = one or more failures
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-CSVQL="${SCRIPT_DIR}/zig-out/bin/csvql"
+CSVQL="${CSVQL_BIN:-${SCRIPT_DIR}/zig-out/bin/csvql}"
 DUCKDB="${DUCKDB_BIN:-duckdb}"
 
 CSV_ARG="${1:-}"
