@@ -71,6 +71,7 @@ csvql "SELECT email FROM 'users.csv'" | wc -l
 | `--delimiter <char>` | `-d`  | Field delimiter (default `,`). Use `\t` for TSV     |
 | `--json`             |       | Output as a JSON array (`[{...}, ...]`)             |
 | `--jsonl`            |       | Output as JSONL / NDJSON (one JSON object per line) |
+| `--markdown`         |       | Output as a GitHub-flavored Markdown table (pipes in cells are escaped, newlines become `<br>`); not combinable with `--json`, `--jsonl` or `--no-header` |
 | `--threads <N>`      |       | Worker threads for parallel execution; `0` uses automatic detection |
 | `--strict`           |       | Error on a WHERE numeric comparison against a non-numeric value instead of silently skipping that row (see [CORRECTNESS.md](CORRECTNESS.md#strict-and-exit-codes)) |
 | `--version`          | `-v`  | Show version                                        |
@@ -88,6 +89,9 @@ csvql "SELECT name, age FROM 'data.csv'" --no-header | awk -F, '{print $2}'
 
 # TSV input, no header in output
 cat data.tsv | csvql "SELECT * FROM '-'" -d $'\t' --no-header
+
+# Markdown table for pasting into an issue or PR (add -o table.md to write a file)
+csvql "SELECT name, age FROM 'data.csv' LIMIT 3" --markdown
 ```
 
 ## Installation
@@ -395,7 +399,7 @@ Full API, options (delimiter/comment/skip-empty-lines), memory comparisons again
 | `VARIANCE`, `STDDEV`, `MEDIAN`, `GROUP_CONCAT` | [#50](https://github.com/melihbirim/csvql/issues/50) | ✅ shipped (v1.9.0) |
 | HTTP/SSE MCP transport (shared service) | [#60](https://github.com/melihbirim/csvql/issues/60) | planned             |
 | `OFFSET` clause | [#70](https://github.com/melihbirim/csvql/issues/70) | ✅ shipped |
-| `--markdown` output | [#72](https://github.com/melihbirim/csvql/issues/72) | help wanted |
+| `--markdown` output | [#72](https://github.com/melihbirim/csvql/issues/72) | ✅ shipped          |
 | Shell completions (bash/zsh) | [#73](https://github.com/melihbirim/csvql/issues/73) | help wanted |
 | `LPAD`, `RPAD` in SELECT | [#160](https://github.com/melihbirim/csvql/issues/160) | ✅ shipped |
 

@@ -10,7 +10,7 @@
 # Both differential suites used to run only on the default fixture from
 # gen_fixture.sh, which is 20,000 rows and 0.65 MB, so every query in CI took
 # the sequential path and the two mmap paths were never executed at all. That
-# is how #223 shipped for roughly sixteen releases: multi-key ORDER BY returned
+# is how #223 shipped for fifty releases: multi-key ORDER BY returned
 # rows sorted on the primary key only, on any file over 5 MB, because neither
 # mmap path resolved the secondary keys and no test ever crossed the threshold.
 #

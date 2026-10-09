@@ -78,6 +78,7 @@ const help_text =
     \\  --jsonl                 Output results as newline-delimited JSON (NDJSON)
     \\  --table                 Always render output as a table (default: auto on TTY)
     \\  --no-table              Never render output as a table
+    \\  --markdown              Render output as a GitHub-flavored Markdown table
     \\  --wrap                  Wrap long cell text across lines instead of dropping columns
     \\  --threads <N>           Worker threads for parallel execution (0 = auto)
     \\  --strict                Error on a WHERE numeric comparison against a non-numeric
@@ -229,6 +230,8 @@ pub fn main() !void {
             opts.no_input_header = true;
         } else if (std.mem.eql(u8, arg, "--no-table")) {
             opts.table_mode = .off;
+        } else if (std.mem.eql(u8, arg, "--markdown")) {
+            opts.table_mode = .markdown;
         } else if (std.mem.eql(u8, arg, "--strict")) {
             opts.strict = true;
         } else if (std.mem.eql(u8, arg, "--threads")) {
@@ -295,14 +298,35 @@ pub fn main() !void {
         std.process.exit(exitCodeForError(err));
     };
 
+    if (opts.table_mode == .markdown) {
+        if (opts.format != .csv) {
+            try stderr_file.writeAll("error: --markdown cannot be combined with --json or --jsonl\n");
+            std.process.exit(1);
+        }
+        if (opts.no_header) {
+            try stderr_file.writeAll("error: --markdown cannot be combined with --no-header (a Markdown table needs a header row)\n");
+            std.process.exit(1);
+        }
+    }
+
     // Determine whether to render as a table
     const use_table = opts.format == .csv and !opts.no_header and switch (opts.table_mode) {
-        .on => true,
+        .on, .markdown => true,
         .off => false,
         .auto => isTty(stdFile(.out)),
     };
 
-    if (output_path) |p| {
+    if (opts.table_mode == .markdown) {
+        const md_out = if (output_path) |p| std.fs.cwd().createFile(p, .{ .truncate = true }) catch {
+            try stderr_file.writeAll("error: cannot open --output file for writing\n");
+            std.process.exit(1);
+        } else stdout_file;
+        defer if (output_path != null) md_out.close();
+        renderTableOutput(allocator, query, md_out, opts) catch |err| {
+            std.debug.print("execution error: {}\n", .{err});
+            std.process.exit(exitCodeForError(err));
+        };
+    } else if (output_path) |p| {
         // Write results straight to a file (no table rendering).
         const out = std.fs.cwd().createFile(p, .{ .truncate = true }) catch {
             try stderr_file.writeAll("error: cannot open --output file for writing\n");
@@ -335,7 +359,7 @@ pub fn main() !void {
 
 /// Run the engine into a memory-backed scratch file, read back, parse CSV,
 /// render via zigtable.
-fn renderTableOutput(allocator: Allocator, query: parser.Query, stdout_file: std.fs.File, opts: options_mod.Options) !void {
+fn renderTableOutput(allocator: Allocator, query: parser.Query, out_file: std.fs.File, opts: options_mod.Options) !void {
     const tmp_file = try memfile.createMemoryBackedFile(allocator, "table");
     defer tmp_file.close();
     try engine.execute(allocator, query, tmp_file, opts);
@@ -343,8 +367,26 @@ fn renderTableOutput(allocator: Allocator, query: parser.Query, stdout_file: std
     const csv_data = try tmp_file.readToEndAlloc(allocator, 4 * 1024 * 1024 * 1024);
     defer allocator.free(csv_data);
 
+    var table_buf: std.ArrayList(u8) = .{};
+    defer table_buf.deinit(allocator);
+    try renderCsvTable(allocator, csv_data, opts, &table_buf);
+    try out_file.writeAll(table_buf.items);
+}
+
+/// Render CSV text as a table into `table_buf`. Markdown mode ignores the
+/// terminal width so a pasted table is never truncated, and escapes cells.
+fn renderCsvTable(allocator: Allocator, csv_data: []const u8, opts: options_mod.Options, table_buf: *std.ArrayList(u8)) !void {
+    const markdown = opts.table_mode == .markdown;
+
     // Use a quote-aware record iterator so multiline quoted fields are not split prematurely.
     var records = CsvRecordIterator.init(csv_data);
+
+    // Track sanitized allocations; they must outlive table.render().
+    var owned: std.ArrayList([]u8) = .{};
+    defer {
+        for (owned.items) |s| allocator.free(s);
+        owned.deinit(allocator);
+    }
 
     // Parse header
     const header_record = records.next() orelse return;
@@ -352,29 +394,38 @@ fn renderTableOutput(allocator: Allocator, query: parser.Query, stdout_file: std
     defer col_list.deinit(allocator);
     var hdr_it = CsvRowIterator.init(header_record, opts.delimiter);
     while (hdr_it.next()) |col_name| {
+        if (markdown) {
+            if (try markdownCell(allocator, col_name, hdr_it.last_quoted)) |escaped| {
+                try owned.append(allocator, escaped);
+                try col_list.append(allocator, .{ .name = escaped });
+                continue;
+            }
+        }
         try col_list.append(allocator, .{ .name = col_name });
     }
     if (col_list.items.len == 0) return;
 
     var table = zigtable.Table.init(allocator, col_list.items);
     defer table.deinit();
-    table.terminal_width = getTerminalWidth();
-    table.wrap_cells = opts.wrap_cells;
+    if (markdown) {
+        table.border_style = .markdown;
+    } else {
+        table.terminal_width = getTerminalWidth();
+        table.wrap_cells = opts.wrap_cells;
+    }
 
     // Add data rows; sanitize embedded newlines so the table renders correctly.
     var row_fields: std.ArrayList([]const u8) = .{};
     defer row_fields.deinit(allocator);
-    // Track sanitized allocations — must outlive table.render().
-    var owned: std.ArrayList([]u8) = .{};
-    defer {
-        for (owned.items) |s| allocator.free(s);
-        owned.deinit(allocator);
-    }
     while (records.next()) |raw_record| {
         row_fields.clearRetainingCapacity();
         var row_it = CsvRowIterator.init(raw_record, opts.delimiter);
         while (row_it.next()) |field| {
-            if (try sanitizeField(allocator, field)) |sanitized| {
+            const cell = if (markdown)
+                try markdownCell(allocator, field, row_it.last_quoted)
+            else
+                try sanitizeField(allocator, field);
+            if (cell) |sanitized| {
                 try owned.append(allocator, sanitized);
                 try row_fields.append(allocator, sanitized);
             } else {
@@ -383,10 +434,6 @@ fn renderTableOutput(allocator: Allocator, query: parser.Query, stdout_file: std
         }
         try table.addRow(row_fields.items);
     }
-
-    // Buffer the table output, then write to stdout in one shot.
-    var table_buf: std.ArrayList(u8) = .{};
-    defer table_buf.deinit(allocator);
 
     const BufWriter = struct {
         buf: *std.ArrayList(u8),
@@ -397,8 +444,37 @@ fn renderTableOutput(allocator: Allocator, query: parser.Query, stdout_file: std
             return data.len;
         }
     };
-    try table.render(BufWriter{ .buf = &table_buf, .alloc = allocator });
-    try stdout_file.writeAll(table_buf.items);
+    try table.render(BufWriter{ .buf = table_buf, .alloc = allocator });
+}
+
+/// Make a CSV field safe for a Markdown table cell: undo CSV quote doubling,
+/// escape `|`, turn line breaks into `<br>`. Returns null when the field
+/// needs no change.
+fn markdownCell(allocator: Allocator, field: []const u8, was_quoted: bool) !?[]u8 {
+    var needs = false;
+    for (field) |c| {
+        if (c == '|' or c == '\n' or c == '\r' or (was_quoted and c == '"')) {
+            needs = true;
+            break;
+        }
+    }
+    if (!needs) return null;
+    var buf = std.ArrayList(u8){};
+    errdefer buf.deinit(allocator);
+    var i: usize = 0;
+    while (i < field.len) : (i += 1) {
+        switch (field[i]) {
+            '|' => try buf.appendSlice(allocator, "\\|"),
+            '\n' => try buf.appendSlice(allocator, "<br>"),
+            '\r' => {},
+            '"' => {
+                try buf.append(allocator, '"');
+                if (was_quoted and i + 1 < field.len and field[i + 1] == '"') i += 1;
+            },
+            else => |c| try buf.append(allocator, c),
+        }
+    }
+    return try buf.toOwnedSlice(allocator);
 }
 
 /// Cross-platform wrappers for standard file handles.
@@ -698,12 +774,15 @@ const CsvRowIterator = struct {
     pos: usize,
     delimiter: u8,
     done: bool = false,
+    /// True when the field most recently returned by next() was quoted.
+    last_quoted: bool = false,
 
     fn init(line: []const u8, delimiter: u8) CsvRowIterator {
         return .{ .line = line, .pos = 0, .delimiter = delimiter };
     }
 
     fn next(self: *CsvRowIterator) ?[]const u8 {
+        self.last_quoted = false;
         if (self.done) return null;
         if (self.pos > self.line.len) return null;
         // Trailing empty field after a delimiter at end
@@ -713,6 +792,7 @@ const CsvRowIterator = struct {
         }
         if (self.line[self.pos] == '"') {
             // Quoted field
+            self.last_quoted = true;
             self.pos += 1;
             const start = self.pos;
             while (self.pos < self.line.len) {
@@ -814,7 +894,7 @@ test "the version string agrees with src/mcp.zig" {
     // and python/pyproject.toml. release.yml rewrites the latter two from the
     // git tag but neither Zig source, so these two are the drift-prone pair and
     // the only ones @embedFile can reach from inside the package. src/mcp.zig
-    // reported 1.0.1 to every MCP client for roughly sixteen releases because
+    // reported 1.0.1 to every MCP client for forty-seven releases because
     // nothing reads that field and so nothing noticed. All four are checked by
     // scripts/check_versions.sh in CI.
     const mcp_src = @embedFile("mcp.zig");
@@ -841,4 +921,90 @@ test "exitCodeForError classifies bad-query, strict-mode, and uncategorized erro
     // Anything else falls back to the uncategorized bucket.
     try std.testing.expectEqual(@as(u8, 1), exitCodeForError(error.FileNotFound));
     try std.testing.expectEqual(@as(u8, 1), exitCodeForError(error.OutOfMemory));
+}
+
+fn renderMarkdownForTest(allocator: Allocator, csv_data: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .{};
+    errdefer buf.deinit(allocator);
+    try renderCsvTable(allocator, csv_data, .{ .table_mode = .markdown }, &buf);
+    return buf.toOwnedSlice(allocator);
+}
+
+test "markdown: header, separator and rows" {
+    const allocator = std.testing.allocator;
+    const out = try renderMarkdownForTest(allocator, "name,age\nAlice,35\nBob,4\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "| name  | age |\n" ++
+            "| :---- | :-- |\n" ++
+            "| Alice | 35  |\n" ++
+            "| Bob   | 4   |\n",
+        out,
+    );
+}
+
+test "markdown: empty result keeps header and separator" {
+    const allocator = std.testing.allocator;
+    const out = try renderMarkdownForTest(allocator, "name,age\n");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("| name | age |\n| :--- | :-- |\n", out);
+}
+
+test "markdown: pipes, newlines, quotes and empty cells are escaped" {
+    const allocator = std.testing.allocator;
+    const csv_data = "a|b,note\n\"x|y\",\"line1\nline2\"\n,\"say \"\"hi\"\"\"\n";
+    const out = try renderMarkdownForTest(allocator, csv_data);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "| a\\|b | note           |\n" ++
+            "| :--- | :------------- |\n" ++
+            "| x\\|y | line1<br>line2 |\n" ++
+            "|      | say \"hi\"       |\n",
+        out,
+    );
+}
+
+test "markdown: output is not truncated to the terminal width" {
+    const allocator = std.testing.allocator;
+    const wide = "w" ** 300;
+    const out = try renderMarkdownForTest(allocator, "c\n" ++ wide ++ "\n");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, wide) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "…") == null);
+}
+
+test "markdown: engine output renders end to end" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll("name,tag\nAlice,a|b\nBob,\n");
+    }
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+    const sql = try std.fmt.allocPrint(allocator, "SELECT name, tag FROM '{s}' ORDER BY name", .{in_path});
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out_file.close();
+    try engine.execute(allocator, query, out_file, .{});
+    try out_file.seekTo(0);
+    const csv_data = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(csv_data);
+
+    const out = try renderMarkdownForTest(allocator, csv_data);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "| name  | tag  |\n" ++
+            "| :---- | :--- |\n" ++
+            "| Alice | a\\|b |\n" ++
+            "| Bob   |      |\n",
+        out,
+    );
 }

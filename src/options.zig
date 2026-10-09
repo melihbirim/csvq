@@ -18,6 +18,8 @@ pub const TableMode = enum {
     on,
     /// Never render as a table (--no-table flag).
     off,
+    /// Render as a GitHub-flavored Markdown table (--markdown flag).
+    markdown,
 };
 
 /// Runtime options parsed from CLI flags.
