@@ -54,9 +54,12 @@ QA = [
 ]
 
 # One-time MCP tool-schema overhead the model pays once per conversation.
-TOOL_SCHEMA = """{"name":"csv_query","description":"Run a read-only SQL query against a CSV file and return the rows.","input_schema":{"type":"object","properties":{"file":{"type":"string","description":"path to the CSV file"},"sql":{"type":"string","description":"SQL SELECT query; FROM must reference the file path in single quotes"}},"required":["file","sql"]}}
-{"name":"csv_schema","description":"Return column names, inferred types, row count and size of a CSV file.","input_schema":{"type":"object","properties":{"file":{"type":"string"}},"required":["file"]}}
-{"name":"csv_list","description":"List CSV/JSON files in a directory.","input_schema":{"type":"object","properties":{"dir":{"type":"string"}},"required":["dir"]}}"""
+# These are the real schemas from src/mcp.zig, not an approximation of them.
+# An earlier version of this file invented a csv_query taking {file, sql},
+# which charged every call for a path the model already writes inside the SQL
+# and so overstated csvql's own cost by about 9 tokens per query.
+TOOL_SCHEMA = """{"name":"csv_query","description":"Execute a SQL query against CSV files and return results as JSON. Supports SELECT, WHERE, GROUP BY, ORDER BY, LIMIT, JOIN, COUNT/SUM/AVG/MIN/MAX, DISTINCT, LIKE. File paths must be single-quoted in FROM. Results are capped (~100 rows / 12KB): do NOT SELECT * on large files — aggregate (COUNT/SUM/AVG with GROUP BY) or add WHERE/LIMIT to answer questions without pulling raw rows. Example: SELECT dept, COUNT(*) FROM 'data.csv' GROUP BY dept","inputSchema":{"type":"object","properties":{"sql":{"type":"string","description":"SQL query with single-quoted file paths in FROM clause"}},"required":["sql"]}}
+{"name":"csv_schema","description":"Show column names and a few sample rows from a CSV file. Call this before csv_query to understand column names and data types.","inputSchema":{"type":"object","properties":{"file":{"type":"string","description":"Path to the CSV file"}},"required":["file"]}}"""
 
 
 def paste_tokens(path):
@@ -71,6 +74,32 @@ def query_tokens(path):
         out = subprocess.run([CSVQL, q], capture_output=True, text=True).stdout
         total += tok(question) + tok(q) + tok(out)  # sent (question+SQL) + received (rows)
     return total
+
+
+def duckdb_shell_tokens(path):
+    """What the same four questions cost an agent that shells out to duckdb.
+
+    Pasting the file is the wrong baseline to stop at: nobody attempts it for a
+    large CSV, so beating it proves little. An agent with a shell tool can run
+    `duckdb -c "SELECT ..."` today, and that is the comparison that decides
+    whether csvql saves anything. Counted both ways because DuckDB's default
+    output is a box-drawing table, which costs roughly 3x the tokens of -csv,
+    and an agent has to know to pass the flag.
+    """
+    out = {}
+    for flag, label in ((None, "box"), ("-csv", "csv")):
+        total = 0
+        for question, sql in QA:
+            q = sql.format(f=path).replace(f"'{path}'", f"read_csv('{path}')")
+            cmd = ["duckdb"] + ([flag] if flag else []) + ["-c", q]
+            shown = "duckdb " + (flag + " " if flag else "") + '-c "' + q + '"'
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True).stdout
+            except FileNotFoundError:
+                return None
+            total += tok(question) + tok(shown) + tok(res)
+        out[label] = total
+    return out
 
 
 def main():
@@ -101,7 +130,20 @@ def main():
         print(f"  {label:>7} {n:>10,} {p:>13,} {q:>9,} {round(p / q):>8,}x  {fits}")
 
     print(f"\n  Query cost is flat — SQL + a few result rows, independent of file size.")
-    print(f"  MCP tool schema: {schema_t} tokens, paid once per conversation (not per query).\n")
+    print(f"  MCP tool schema: {schema_t} tokens, paid once per conversation (not per query).")
+
+    # The honest competitor: an agent with a shell, not an agent pasting a file.
+    dd = duckdb_shell_tokens(SRC)
+    if dd is None:
+        print("\n  duckdb not on PATH, skipping the shell comparison.\n")
+    else:
+        mcp = query_tokens(SRC)
+        print(f"\n  Same {len(QA)} questions, same file, no paste anywhere:")
+        print(f"    csvql via MCP                    {mcp:>6,} tokens")
+        print(f"    duckdb via shell, -csv           {dd['csv']:>6,} tokens  ({dd['csv']/mcp:.2f}x)")
+        print(f"    duckdb via shell, default output {dd['box']:>6,} tokens  ({dd['box']/mcp:.2f}x)")
+        print("    The -csv row is the one to beat; the gap is small and the flag is")
+        print("    easy for a model to forget, which is most of the difference.\n")
 
 
 if __name__ == "__main__":
