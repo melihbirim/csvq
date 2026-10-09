@@ -204,7 +204,22 @@ The last two rows are losses to polars, stated because leaving them out would ma
 | polars 2.0 | 0.2187 | 3.9x |
 | DuckDB | 0.5767 | 10.2x |
 
-**Memory.** On aggregates csvql holds a running accumulator rather than a dataset, so peak memory is flat in file size. On the same 711 MB file, `GROUP BY department`: csvql **54 MB**, polars 2.0 **1110 MB**. This is a property of aggregate queries, not of every query: `ORDER BY` has to hold rows, and the same file peaks at 715 MB.
+**How it scales.** Same `GROUP BY department`, four engines, one process each, across a 12x range of file size on a 16 GB machine. Peak RSS and wall time:
+
+| file | csvql | DuckDB | polars 2.0 | pandas |
+| --- | --- | --- | --- | --- |
+| 0.69 GB | **74 MB / 0.2s** | 254 MB / 0.8s | 1151 MB / 0.6s | 1445 MB / 6.5s |
+| 1.89 GB | **74 MB / 0.4s** | 253 MB / 1.2s | 2107 MB / 1.1s | 2093 MB / 17.5s |
+| 3.80 GB | **75 MB / 0.7s** | 275 MB / 2.1s | 2666 MB / 9.8s | 2355 MB / 36.4s |
+| 8.14 GB | **74 MB / 2.4s** | 367 MB / 5.5s | 1754 MB / 26.7s | 4024 MB / 90.8s |
+
+csvql's memory does not move: 74 MB on a 0.69 GB file and 74 MB on an 8.14 GB one, because an aggregate holds a running accumulator rather than a dataset. The time advantage over polars *grows* with the file, from 3x to 11x, and over pandas from 33x to 38x.
+
+Two things worth saying plainly. **DuckDB is the memory-efficient competitor, not polars**: 254 to 367 MB across the same range, nearly as flat as csvql, so against DuckDB the memory difference is 3.7x rather than the 15x polars suggests. And every engine here finished the 8 GB file on 16 GB of RAM, so there is no point at which the others fall over and csvql keeps going. pandas peaks at 4 GB on an 8 GB file because it stores parsed typed columns rather than text, and polars' peak is not even monotonic (2666 MB at 3.8 GB, 1754 MB at 8.1 GB), so do not extrapolate either curve.
+
+Flat memory is a property of aggregate queries, not of every query: `ORDER BY` has to hold rows, and the 711 MB file peaks at 715 MB on a top-N.
+
+All four rows are measured the same way, in-process from Python via `ru_maxrss`, so each includes the interpreter's own footprint of roughly 20 MB. That is why csvql reads 74 MB here and 54 MB when the CLI is measured directly; the table is internally comparable, which matters more than csvql's number looking smaller.
 
 Reproduce with [`bench/bench_vs_polars.sh`](bench/bench_vs_polars.sh). Full working and the corrections to an earlier version of these numbers: [csvql vs polars](https://melihbirim.github.io/csvql/blog/csvql-vs-polars.html).
 
