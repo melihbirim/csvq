@@ -2942,6 +2942,7 @@ fn evalScalarOnSingleValue(spec: scalar.ScalarSpec, value: []const u8, arena: Al
         .substr => |*a| a.col_idx = 0,
         .lpad, .rpad => |*a| a.col_idx = 0,
         .mod_op => |*a| a.col_idx = 0,
+        .math => |*a| a.col_idx = 0,
         .coalesce => |*a| {
             for (a.colsMut()) |*ci| ci.* = 0;
         },
@@ -8680,6 +8681,46 @@ test "LPAD/RPAD: pads through the full query pipeline" {
 
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "000ab,ab000"));
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "00xyz,xyz00"));
+}
+
+test "SQRT/POWER/LN/LOG/EXP/TRUNC: evaluate through the full query pipeline" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("v\n16\n-4\n\n0\nabc\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT SQRT(v), POWER(v,2) AS sq, LN(v), LOG(v), LOG(2,v), EXP(v), TRUNC(v) FROM '{s}'",
+        .{p},
+    );
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    const expected =
+        "SQRT(v),sq,LN(v),LOG(v),\"LOG(2,v)\",EXP(v),TRUNC(v)\n" ++
+        "4.0,256.0,2.772588722239781,1.2041199826559248,4.0,8886110.520507872,16.0\n" ++
+        ",16.0,,,,0.01831563888873418,-4.0\n" ++
+        ",,,,,,\n" ++
+        "0.0,0.0,,,,1.0,0.0\n" ++
+        "abc,abc,abc,abc,abc,abc,abc\n";
+    try std.testing.expectEqualStrings(expected, data);
 }
 
 test "ABS: returns absolute value of negative numbers" {

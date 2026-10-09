@@ -617,6 +617,11 @@ check \
   "SELECT id, MOD(age, 3) FROM '$CSV' WHERE id <= 20 ORDER BY id" \
   "SELECT id, MOD(age, 3) FROM read_csv_auto('$CSV') WHERE id <= 20 ORDER BY id"
 
+check_approx \
+  "SQRT/POWER/LN/LOG/TRUNC on positive columns" \
+  "SELECT id, SQRT(age), POWER(age, 2), LN(salary), LOG(salary), LOG(2, age), TRUNC(salary) FROM '$CSV' WHERE id <= 20 ORDER BY id" \
+  "SELECT id, SQRT(age), POWER(age, 2), LN(salary), LOG(salary), LOG(2, age), TRUNC(salary) FROM read_csv_auto('$CSV') WHERE id <= 20 ORDER BY id"
+
 check \
   "COALESCE(department, 'Unknown')" \
   "SELECT id, COALESCE(department, 'Unknown') FROM '$CSV' WHERE id <= 20 ORDER BY id" \
