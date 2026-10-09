@@ -1643,6 +1643,33 @@ fn expectMath(expr: []const u8, input: []const u8, expected: []const u8) !void {
     try std.testing.expectEqualStrings(expected, eval(spec, &.{input}, allocator));
 }
 
+/// Like expectMath, but compares numerically with a relative tolerance.
+///
+/// IEEE 754 requires `sqrt` to be correctly rounded, so SQRT results are
+/// bit-identical on every platform and expectMath is right for them. It does
+/// not require that of `exp`, `log` or `pow`, so those are whatever the
+/// platform's libm returns and can differ in the last bit: glibc on x86_64
+/// gives EXP(1) as 2.7182818284590455 where Apple's libm gives
+/// 2.718281828459045, and LOG(3, 81) as 4.000000000000001 rather than 4.0.
+/// Asserting an exact decimal string for a transcendental therefore passes on
+/// one CI runner and fails on another, which is how this landed red.
+fn expectMathApprox(expr: []const u8, input: []const u8, expected: f64) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("v", 0);
+    const spec = (try tryParseScalar(expr, cm, allocator)).?;
+    const out = eval(spec, &.{input}, allocator);
+    const got = std.fmt.parseFloat(f64, out) catch {
+        std.debug.print("expected a number near {d}, got \"{s}\"\n", .{ expected, out });
+        return error.TestExpectedApproxEqAbs;
+    };
+    // 1e-12 relative is far tighter than any real libm disagreement and far
+    // looser than one ulp of decimal formatting.
+    try std.testing.expectApproxEqRel(expected, got, 1e-12);
+}
+
 test "SQRT: results are doubles, a negative input is NULL" {
     try expectMath("SQRT(v)", "16", "4.0");
     try expectMath("SQRT(v)", "2", "1.4142135623730951");
@@ -1665,7 +1692,7 @@ test "POWER/POW: literal exponent, NaN and overflow are NULL" {
 
 test "LN: zero and negative inputs are NULL" {
     try expectMath("LN(v)", "1", "0.0");
-    try expectMath("LN(v)", "2.718281828459045", "1.0");
+    try expectMathApprox("LN(v)", "2.718281828459045", 1.0);
     try expectMath("LN(v)", "0", "");
     try expectMath("LN(v)", "-1", "");
 }
@@ -1676,7 +1703,7 @@ test "LOG: base 10 by default, optional literal base first" {
     try expectMath("LOG(v)", "0", "");
     try expectMath("LOG(v)", "-5", "");
     try expectMath("LOG(2, v)", "8", "3.0");
-    try expectMath("LOG(3, v)", "81", "4.0");
+    try expectMathApprox("LOG(3, v)", "81", 4.0); // ratio of logs, not exact on glibc
     try expectMath("LOG(2.5, v)", "0", "");
     try expectMath("LOG(2, v)", "-8", "");
 }
@@ -1694,7 +1721,7 @@ test "LOG: a base that is not positive or is 1 is rejected at parse time" {
 
 test "EXP: overflow is NULL, underflow to zero is kept" {
     try expectMath("EXP(v)", "0", "1.0");
-    try expectMath("EXP(v)", "1", "2.718281828459045");
+    try expectMathApprox("EXP(v)", "1", 2.718281828459045);
     try expectMath("EXP(v)", "1000", "");
     try expectMath("EXP(v)", "-1000", "0.0");
 }
